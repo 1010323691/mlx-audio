@@ -180,6 +180,45 @@ def test_greedy_batch_matches_single_rows(cpu, seed, repetition_penalty):
         assert result.token_count in (0, len(codes))
 
 
+@pytest.mark.parametrize("seed", range(3))
+def test_greedy_batch_with_a_different_reference_clip_per_row(cpu, seed):
+    # The server batches requests whose reference clips differ (one speaker per
+    # row, as in audiobook synthesis): each row must still see only its own clip.
+    model = _model(seed)
+    rows = [
+        ("abc", "calm", mx.ones((20,)), "first"),
+        ("hello there friend", "happy", mx.ones((36,)), "second speaker"),
+        ("x", None, None, None),
+        ("longer text here ok", "sad", mx.ones((12,)), "third"),
+    ]
+    kwargs = dict(cfg_scale=3.0, temperature=0, max_tokens=30)
+    expected = []
+    for text, instruct, ref_audio, ref_text in rows:
+        model.audio_tokenizer.decoded = []
+        list(
+            model.generate(
+                text,
+                instruct=instruct,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                split_pattern=None,
+                **kwargs,
+            )
+        )
+        expected.append(model.audio_tokenizer.decoded[-1])
+    model.audio_tokenizer.decoded = []
+    list(
+        model.batch_generate(
+            [row[0] for row in rows],
+            instructs=[row[1] for row in rows],
+            ref_audios=[row[2] for row in rows],
+            ref_texts=[row[3] for row in rows],
+            **kwargs,
+        )
+    )
+    assert model.audio_tokenizer.decoded == expected
+
+
 def test_rows_stop_independently_and_cfg_rows_compact(cpu):
     # Seed 0 has rows ending at 1, 20+ and 30 frames, including a CFG row that
     # finishes while other rows (and other CFG twins) keep decoding.

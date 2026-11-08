@@ -1341,6 +1341,10 @@ class Model(nn.Module):
     # Batched generation
     # ------------------------------------------------------------------
 
+    # batch_generate takes a reference clip (and transcript) per row, so the server
+    # may batch requests whose clips differ.
+    batch_generate_per_row_refs = True
+
     def supports_tts_batch(
         self,
         *,

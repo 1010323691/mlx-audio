@@ -348,6 +348,10 @@ class STTExecutionAdapter(BaseModelExecutionAdapter):
 
 
 class ModelLoadExecutionAdapter(BaseModelExecutionAdapter):
+    # Every /v1/audio/speech request preflights its model through the broker before it
+    # submits the speech request, so a batch gather window must not keep these waiting.
+    run_while_gathering = True
+
     def run_serial(self, request: InferenceRequest) -> None:
         _load_model_for_inference(request.model_name)
         request.emit_done()
@@ -456,6 +460,15 @@ class _TTSAdapterContinuousSession:
 
 
 _SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "repetition_penalty")
+# ref_audio and ref_text close TTSExecutionAdapter.batch_key.
+_REF_KEY_FIELDS = 2
+
+
+def _env_ms(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
 
 
 def _resolve_sampling_params(model, speech_request: SpeechRequest) -> dict[str, Any]:
@@ -481,6 +494,12 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             self.max_batch_size = max(1, int(raw_max_batch_size))
         except ValueError:
             self.max_batch_size = 8
+        # Fixed-window batch gathering (see InferenceBroker._gather_batch): wait up
+        # to this long between arrivals, and this long in all, for a batch to fill.
+        self.batch_gather_s = _env_ms("MLX_AUDIO_TTS_BATCH_GATHER_MS", 250) / 1000
+        self.batch_gather_max_s = (
+            _env_ms("MLX_AUDIO_TTS_BATCH_GATHER_MAX_MS", 3000) / 1000
+        )
 
     def _get_model_for_request(self, request: InferenceRequest):
         model = getattr(request, self._REQUEST_MODEL_ATTR, None)
@@ -606,13 +625,32 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             # config, so only requests that set the same fields can share a batch.
             tuple(name in speech_request.model_fields_set for name in _SAMPLING_FIELDS),
             speech_request.max_tokens,
-            speech_request.ref_audio,
-            speech_request.ref_text,
             speech_request.streaming_interval if speech_request.stream else None,
             speech_request.verbose,
             speech_request.cfg_scale,
             speech_request.seed,
+            # Keep the reference clip last: is_batch_compatible ignores it for
+            # models whose batch_generate takes a clip per row.
+            speech_request.ref_audio,
+            speech_request.ref_text,
         )
+
+    def is_batch_compatible(
+        self, request: InferenceRequest, candidate: InferenceRequest
+    ) -> bool:
+        if candidate.batch_key == request.batch_key:
+            return True
+        key, other = request.batch_key, candidate.batch_key
+        if (
+            not isinstance(key, tuple)
+            or not isinstance(other, tuple)
+            or len(key) != len(other)
+            or key[:-_REF_KEY_FIELDS] != other[:-_REF_KEY_FIELDS]
+            or key[1]  # streaming requests never use batch_generate
+        ):
+            return False
+        model = self._get_model_for_request(request)
+        return getattr(model, "batch_generate_per_row_refs", False) is True
 
     def continuous_batch_key(self, request: InferenceRequest) -> Any:
         return self.batch_key(request)
