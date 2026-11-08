@@ -1288,6 +1288,79 @@ def test_tts_run_batch_uses_generate_config():
         assert kinds == ["data", "done"]
 
 
+def test_tts_speech_forwards_cfg_scale_and_seed_only_when_sent(
+    client, mock_model_provider
+):
+    model = _tts_model_with_config(None)
+    mock_model_provider.load_model = MagicMock(return_value=model)
+
+    response = client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "breeze",
+            "input": "Hello",
+            "instruct": "calm",
+            "cfg_scale": 4.0,
+            "seed": 7,
+        },
+    )
+    assert response.status_code == 200
+    _, kwargs = model.generate.call_args
+    assert (kwargs["cfg_scale"], kwargs["seed"]) == (4.0, 7)
+
+    response = client.post(
+        "/v1/audio/speech", json={"model": "breeze", "input": "Hello"}
+    )
+    assert response.status_code == 200
+    _, kwargs = model.generate.call_args
+    # Models without guidance / seed options keep their exact call.
+    assert "cfg_scale" not in kwargs and "seed" not in kwargs
+
+
+class _GuidedBatchTTSModel(_BatchTTSModel):
+    def batch_generate(
+        self, texts, instructs=None, cfg_scale=None, seed=None, max_tokens=0, **_
+    ):
+        self.batch_calls.append(
+            {"instructs": instructs, "cfg_scale": cfg_scale, "seed": seed}
+        )
+        for idx, _text in enumerate(texts):
+            result = MockAudioResult(np.zeros(160, dtype=np.float32), 16000)
+            result.sequence_idx = idx
+            yield result
+
+
+def test_tts_run_batch_passes_cfg_scale_and_seed():
+    from mlx_audio.server import TTSExecutionAdapter
+
+    adapter = TTSExecutionAdapter()
+    model = _GuidedBatchTTSModel(None)
+    requests = [
+        _tts_inference_request(model, instruct=f"tone {i}", cfg_scale=4.0, seed=3)
+        for i in range(2)
+    ]
+
+    adapter.run_batch(requests)
+
+    assert model.batch_calls == [
+        {"instructs": ["tone 0", "tone 1"], "cfg_scale": 4.0, "seed": 3}
+    ]
+
+
+def test_tts_batch_key_separates_cfg_scale_and_seed():
+    from mlx_audio.server import TTSExecutionAdapter
+
+    adapter = TTSExecutionAdapter()
+    model = _tts_model_with_config(None)
+    key = lambda **fields: adapter.batch_key(
+        _tts_inference_request(model, **fields)
+    )  # noqa: E731
+
+    assert key(cfg_scale=4.0) == key(cfg_scale=4.0)
+    assert key(cfg_scale=4.0) != key(cfg_scale=1.0) != key()
+    assert key(seed=1) != key(seed=2)
+
+
 def test_tts_batch_key_separates_omitted_from_sent_sampling():
     from mlx_audio.server import TTSExecutionAdapter
 

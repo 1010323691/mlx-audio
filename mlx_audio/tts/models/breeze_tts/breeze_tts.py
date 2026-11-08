@@ -19,10 +19,10 @@ from mlx.utils import tree_flatten
 
 from mlx_audio.lm.models import llama, qwen3
 from mlx_audio.lm.models.base import create_attention_mask, scaled_dot_product_attention
-from mlx_audio.lm.models.cache import KVCache
+from mlx_audio.lm.models.cache import BatchKVCache, KVCache
 from mlx_audio.lm.models.rope_utils import initialize_rope
 from mlx_audio.lm.sample_utils import make_sampler
-from mlx_audio.tts.models.base import GenerationResult
+from mlx_audio.tts.models.base import BatchGenerationResult, GenerationResult
 from mlx_audio.utils import load_audio
 
 from .config import ModelConfig
@@ -172,6 +172,7 @@ class _Backbone(nn.Module):
         *,
         input_embeddings: Optional[mx.array] = None,
         cache: Optional[list[KVCache]] = None,
+        mask: Optional[mx.array] = None,
     ) -> mx.array:
         if (input_ids is None) == (input_embeddings is None):
             raise ValueError("Pass exactly one of input_ids or input_embeddings.")
@@ -182,13 +183,18 @@ class _Backbone(nn.Module):
         )
         if cache is None:
             cache = [None] * len(self.layers)
-        mask = create_attention_mask(hidden, cache[0])
+        if mask is None:
+            mask = create_attention_mask(hidden, cache[0])
         for layer, layer_cache in zip(self.layers, cache):
             hidden = layer(hidden, mask, layer_cache)
         return self.norm(hidden)
 
     def make_cache(self) -> list[KVCache]:
         return [KVCache() for _ in self.layers]
+
+    def make_batch_cache(self, left_padding: list[int]) -> list[BatchKVCache]:
+        """Per-row offset caches for left-padded batch prompts."""
+        return [BatchKVCache(left_padding) for _ in self.layers]
 
 
 class _TextEmbedding(nn.Module):
@@ -537,10 +543,14 @@ class _DepthModel(nn.Module):
     def embed_codebook_token(
         self, token_id: Union[int, mx.array], codebook_idx: int
     ) -> mx.array:
-        """Embed an int or one-element device array in the codebook's vocabulary."""
+        """Embed codebook ids as ``[batch, 1, embed]``.
+
+        ``token_id`` is an int, a one-element array (batch 1) or a ``[batch]``
+        device array (one token per row).
+        """
         if not isinstance(token_id, mx.array):
             token_id = mx.array(token_id)
-        ids = token_id.astype(mx.int32).reshape(1, 1) + codebook_idx * self.vocab_size
+        ids = token_id.astype(mx.int32).reshape(-1, 1) + codebook_idx * self.vocab_size
         return self.embed_tokens(ids)
 
     def step(self, embeds: mx.array, cache: list[KVCache]) -> mx.array:
@@ -850,7 +860,14 @@ class Model(nn.Module):
         instruct: Optional[str],
         ref_audio: Optional[Union[str, Path, mx.array]],
         ref_text: Optional[str],
+        reference_codes: Optional[mx.array] = None,
     ) -> mx.array:
+        """Build one row's ``[1, length, hidden]`` prompt embeddings.
+
+        ``reference_codes`` lets batch callers reuse an already encoded
+        ``ref_audio`` (``[1, frames, codebooks]``) instead of re-running the
+        codec encoder for every row that shares a reference clip.
+        """
         if isinstance(ref_audio, (list, tuple)):
             if len(ref_audio) != 1:
                 raise ValueError(
@@ -869,7 +886,16 @@ class Model(nn.Module):
         segments: list[tuple[str, mx.array]] = []
         if ref_audio is not None:
             segments.append(("text", self._text_ids(f"{speaker}{ref_text}")))
-            segments.append(("audio", self._encode_reference(ref_audio)))
+            segments.append(
+                (
+                    "audio",
+                    (
+                        reference_codes
+                        if reference_codes is not None
+                        else self._encode_reference(ref_audio)
+                    ),
+                )
+            )
         target = f"{speaker}{text}"
         if instruct:
             target = f"{speaker}<ins_bos>{instruct}<ins_eos>{text}"
@@ -1310,3 +1336,437 @@ class Model(nn.Module):
                 peak_memory_usage=mx.get_peak_memory() / 1e9,
                 is_final_chunk=is_last_segment,
             )
+
+    # ------------------------------------------------------------------
+    # Batched generation
+    # ------------------------------------------------------------------
+
+    def supports_tts_batch(
+        self,
+        *,
+        stream: bool = False,
+        speed: Optional[float] = 1.0,
+        pitch: Optional[float] = 1.0,
+        **kwargs,
+    ) -> bool:
+        """Whether a request can be served by :meth:`batch_generate`.
+
+        Voice tags, instructions, reference audio/text and CFG are all handled
+        per row; only streaming and post-processing knobs are unsupported.
+        """
+        del kwargs
+        if stream:
+            return False
+        return speed in (None, 1.0) and pitch in (None, 1.0)
+
+    @staticmethod
+    def _per_row(values: Any, count: int, name: str) -> list:
+        """Broadcast ``None``/a scalar to every row, or validate a per-row list."""
+        if values is None:
+            return [None] * count
+        if isinstance(values, (str, Path)):
+            return [values] * count
+        if isinstance(values, (list, tuple)):
+            if len(values) == count:
+                return list(values)
+            if len(values) == 1:
+                return [values[0]] * count
+            raise ValueError(
+                f"Breeze batch_generate got {len(values)} {name} for {count} texts."
+            )
+        # A single array-like reference clip shared by every row.
+        return [values] * count
+
+    @staticmethod
+    def _prefill_mask(left_padding: list[int], length: int) -> mx.array:
+        """Causal mask that hides each row's left padding.
+
+        Padded query positions may still attend to themselves so that no
+        softmax row is fully masked (which would put NaNs into the padded
+        key/value slots of later layers); real positions never see padding.
+        """
+        query = mx.arange(length)[:, None]
+        key = mx.arange(length)[None, :]
+        pad = mx.array(left_padding, dtype=mx.int32)[:, None, None, None]
+        visible = (query >= key) & (key >= pad)
+        return visible | (query == key)
+
+    @staticmethod
+    def _combine_cfg(
+        logits: mx.array,
+        rows: int,
+        uncond_index: Optional[mx.array],
+        scale: Optional[mx.array],
+    ) -> mx.array:
+        """``uncond + scale * (cond - uncond)`` per row.
+
+        ``logits`` holds the ``rows`` conditional rows followed by the extra
+        unconditional rows.  Rows without CFG point ``uncond_index`` at
+        themselves with scale 1, which returns their logits unchanged.
+        """
+        if uncond_index is None:
+            return logits
+        cond = logits[:rows]
+        uncond = logits[uncond_index]
+        return uncond + scale.astype(cond.dtype) * (cond - uncond)
+
+    def _depth_tokens_batch(
+        self,
+        first_codebook: mx.array,
+        hidden: mx.array,
+        *,
+        rows: int,
+        uncond_index: Optional[mx.array],
+        expand_index: Optional[mx.array],
+        scale: Optional[mx.array],
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> mx.array:
+        """Complete one frame for every row; returns ``[rows, codebooks - 1]``.
+
+        ``hidden`` contains the conditional rows and then the unconditional
+        CFG rows; ``expand_index`` maps each of those back to the conditional
+        row whose sampled token it consumes (the same token is fed to the
+        conditional and unconditional depth passes, as in ``_depth_tokens``).
+        """
+        depth = self.depth_decoder
+        cache = depth.model.make_cache()
+        depth.start_frame(hidden, cache)
+        token = first_codebook
+        sampled: list[mx.array] = []
+        for head_idx in range(self.num_codebooks - 1):
+            inputs = token if expand_index is None else token[expand_index]
+            logits = depth.step_logits(cache, head_idx=head_idx, token_id=inputs)
+            logits = self._combine_cfg(logits, rows, uncond_index, scale)
+            logits = self._mask_reserved_codec_logits(logits)
+            token = self._sample_array(
+                logits, temperature=temperature, top_p=top_p, top_k=top_k
+            ).reshape(rows)
+            sampled.append(token)
+        if not sampled:
+            return mx.zeros((rows, 0), dtype=mx.int32)
+        return mx.stack(sampled, axis=1).astype(mx.int32)
+
+    def _batch_prefill(
+        self,
+        texts: list[str],
+        voices: list,
+        instructs: list,
+        ref_audios: list,
+        ref_texts: list,
+        use_cfg: list[bool],
+    ) -> tuple[mx.array, list[BatchKVCache], list[int]]:
+        """Left-pad every row's prompt and run one batched backbone prefill.
+
+        Cache rows are the conditional rows in input order followed by one
+        unconditional row per CFG row (``uncond_owner`` gives its input row).
+        Returns the last hidden state of every cache row and the cache.
+        """
+        # Encode each distinct reference clip once per call.
+        encoded_refs: dict[Any, mx.array] = {}
+
+        def reference_codes(ref_audio):
+            if ref_audio is None:
+                return None
+            if isinstance(ref_audio, (list, tuple)):
+                if len(ref_audio) != 1:
+                    raise ValueError(
+                        "Breeze supports exactly one reference audio item per row."
+                    )
+                ref_audio = ref_audio[0]
+            key = (
+                ("path", str(ref_audio))
+                if isinstance(ref_audio, (str, Path))
+                else ("object", id(ref_audio))
+            )
+            if key not in encoded_refs:
+                encoded_refs[key] = self._encode_reference(ref_audio)
+            return encoded_refs[key]
+
+        # Cache rows are [conditional rows..., unconditional CFG rows...].
+        cond_prompts: list[mx.array] = []
+        uncond_prompts: list[mx.array] = []
+        uncond_owner: list[int] = []
+        for row, text in enumerate(texts):
+            text = text.strip() or text
+            if ref_audios[row] is not None and not ref_texts[row]:
+                raise ValueError(
+                    "Breeze voice cloning requires ref_text with ref_audio."
+                )
+            codes = reference_codes(ref_audios[row])
+            prompt_kwargs = dict(
+                voice=voices[row],
+                ref_audio=ref_audios[row],
+                ref_text=ref_texts[row],
+                reference_codes=codes,
+            )
+            cond_prompts.append(
+                self._prompt_embeddings(text, instruct=instructs[row], **prompt_kwargs)
+            )
+            if use_cfg[row]:
+                uncond_prompts.append(
+                    self._prompt_embeddings(text, instruct=None, **prompt_kwargs)
+                )
+                uncond_owner.append(row)
+        all_prompts = cond_prompts + uncond_prompts
+        lengths = [int(p.shape[1]) for p in all_prompts]
+        width = max(lengths)
+        left_padding = [width - length for length in lengths]
+        padded = [
+            (
+                mx.concatenate(
+                    [mx.zeros((1, pad, p.shape[-1]), dtype=p.dtype), p], axis=1
+                )
+                if pad
+                else p
+            )
+            for p, pad in zip(all_prompts, left_padding)
+        ]
+        embeddings = mx.concatenate(padded, axis=0)
+        del cond_prompts, uncond_prompts, all_prompts, padded
+
+        cache = self.backbone_model.make_batch_cache(left_padding)
+        hidden = self.backbone_model(
+            input_embeddings=embeddings,
+            cache=cache,
+            mask=self._prefill_mask(left_padding, width),
+        )[:, -1, :]
+        return hidden, cache, uncond_owner
+
+    def batch_generate(
+        self,
+        texts: list[str],
+        voices: Optional[Union[str, list[Optional[str]]]] = None,
+        instructs: Optional[Union[str, list[Optional[str]]]] = None,
+        ref_audios: Optional[Any] = None,
+        ref_texts: Optional[Union[str, list[Optional[str]]]] = None,
+        cfg_scale: Optional[float] = None,
+        max_tokens: Union[int, list[int]] = 750,
+        temperature: float = 0.9,
+        top_p: float = 1.0,
+        top_k: int = 50,
+        repetition_penalty: float = 1.0,
+        seed: Optional[int] = None,
+        stream: bool = False,
+        verbose: bool = False,
+        sync_steps: int = 4,
+        **_: object,
+    ) -> Generator[BatchGenerationResult, None, None]:
+        """Generate several independent utterances in one batched decode.
+
+        Every row is the same as one ``generate`` call with
+        ``split_pattern=None`` (the text is only stripped): no newline or
+        600-character splitting is done here, so callers should send one
+        line per row.  Rows may differ in text, voice tag, instruction and
+        reference clip.  A row uses classifier-free guidance iff it has an
+        instruction and ``cfg_scale`` is not ``None``/``1.0``; only those
+        rows get an extra unconditional backbone/depth row.
+
+        Prompts are left-padded to a common length.  A per-row causal mask
+        hides the padding and ``BatchKVCache`` gives each row its own RoPE
+        positions, so a padded row sees exactly what it would see alone
+        (results can still differ in the last bits because batched kernels
+        reduce in a different order, which greedy decoding can amplify).
+        Each row stops at its own EOS or after ``max_tokens`` frames
+        (an int, or one cap per row); finished rows are removed from the
+        batch.  Sampled frames are read back to the host every
+        ``sync_steps`` steps so graph construction overlaps GPU work; rows
+        that finished inside a window are trimmed, so the window only costs
+        a few wasted steps, never different output.  Results are yielded in
+        row order after the whole batch has finished.  With the same
+        ``seed`` a batch is reproducible, but sampled rows do not reproduce
+        the random stream of separate ``generate`` calls.
+        """
+        if stream:
+            raise ValueError("Breeze batch_generate does not support streaming.")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative.")
+        if temperature < 0:
+            raise ValueError("temperature must be non-negative.")
+        if not 0 <= top_p <= 1:
+            raise ValueError("top_p must be between 0 and 1.")
+        if repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be positive.")
+        if cfg_scale is not None and not math.isfinite(cfg_scale):
+            raise ValueError("cfg_scale must be finite.")
+        if isinstance(texts, str):
+            texts = [texts]
+        texts = list(texts)
+        count = len(texts)
+        if count == 0:
+            return
+        if seed is not None:
+            mx.random.seed(seed)
+
+        if isinstance(max_tokens, (list, tuple)):
+            token_caps = [
+                int(cap) for cap in self._per_row(max_tokens, count, "max_tokens")
+            ]
+        else:
+            token_caps = [int(max_tokens)] * count
+        if min(token_caps) <= 0:
+            raise ValueError("max_tokens must be positive.")
+        voices = self._per_row(voices, count, "voices")
+        instructs = self._per_row(instructs, count, "instructs")
+        ref_texts = self._per_row(ref_texts, count, "ref_texts")
+        ref_audios = self._per_row(ref_audios, count, "ref_audios")
+
+        started = time.perf_counter()
+        use_cfg = [bool(ins) and cfg_scale not in (None, 1.0) for ins in instructs]
+        scale_value = 1.0 if cfg_scale is None else float(cfg_scale)
+
+        hidden, cache, uncond_owner = self._batch_prefill(
+            texts, voices, instructs, ref_audios, ref_texts, use_cfg
+        )
+
+        # ``active`` lists the original row of each conditional cache row;
+        # ``active_uncond`` the original row of each unconditional cache row.
+        active = list(range(count))
+        active_uncond = list(uncond_owner)
+        frames: list[list[list[int]]] = [[] for _ in range(count)]
+        valid = self.vocab_size + 1
+        penalize = repetition_penalty != 1.0
+        seen = mx.zeros((count, valid), dtype=mx.bool_) if penalize else None
+        vocab_ids = mx.arange(valid)[None, :]
+
+        def cfg_indices():
+            if not active_uncond:
+                return None, None, None
+            rows = len(active)
+            position = {row: i for i, row in enumerate(active)}
+            uncond_index = list(range(rows))
+            expand_index = list(range(rows))
+            for j, row in enumerate(active_uncond):
+                uncond_index[position[row]] = rows + j
+                expand_index.append(position[row])
+            scale = [scale_value if use_cfg[row] else 1.0 for row in active]
+            return (
+                mx.array(uncond_index, dtype=mx.int32),
+                mx.array(expand_index, dtype=mx.int32),
+                mx.array(scale)[:, None],
+            )
+
+        uncond_index, expand_index, scale = cfg_indices()
+        sync_steps = max(1, int(sync_steps))
+        pending_frames: list[mx.array] = []
+        pending_eos: list[mx.array] = []
+        steps = 0
+        step_limit = max(token_caps)
+        while active:
+            rows = len(active)
+            logits = self._combine_cfg(self.lm_head(hidden), rows, uncond_index, scale)
+            if penalize:
+                penalized = mx.where(
+                    logits < 0,
+                    logits * repetition_penalty,
+                    logits / repetition_penalty,
+                )
+                logits = mx.where(seen, penalized, logits)
+            logits = self._mask_reserved_codec_logits(logits)
+            first = self._sample_array(
+                logits,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                allow_eos=True,
+            ).reshape(rows)
+            is_eos = first == self.vocab_size
+            first_safe = mx.where(is_eos, 0, first).astype(mx.int32)
+            rest = self._depth_tokens_batch(
+                first_safe,
+                hidden,
+                rows=rows,
+                uncond_index=uncond_index,
+                expand_index=expand_index,
+                scale=scale,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+            frame = mx.concatenate([first_safe[:, None], rest], axis=1)
+            if penalize:
+                seen = seen | (vocab_ids == first[:, None])
+            inputs = frame if expand_index is None else frame[expand_index]
+            hidden = self.backbone_model(input_ids=inputs[:, None, :], cache=cache)[
+                :, -1, :
+            ]
+            mx.async_eval(hidden, frame, is_eos, *([seen] if penalize else []))
+            pending_frames.append(frame)
+            pending_eos.append(is_eos)
+            steps += 1
+            # Read frames back only every ``sync_steps`` steps: without a
+            # blocking host sync, Python builds the next step's graph while
+            # the GPU is still running this one.  A row that hit EOS inside
+            # the window keeps decoding (ignored) until the next sync.
+            if len(pending_frames) < sync_steps and steps < step_limit:
+                continue
+            block_frames = mx.stack(pending_frames, axis=1).tolist()
+            block_eos = mx.stack(pending_eos, axis=1).tolist()
+            pending_frames, pending_eos = [], []
+
+            keep: list[int] = []
+            for i, row in enumerate(active):
+                finished = False
+                for frame_row, eos in zip(block_frames[i], block_eos[i]):
+                    if eos:
+                        finished = True
+                        break
+                    frames[row].append(frame_row)
+                    if len(frames[row]) >= token_caps[row]:
+                        finished = True
+                        break
+                if not finished:
+                    keep.append(i)
+            if len(keep) == rows:
+                continue
+            if not keep:
+                break
+            # Drop finished rows (and their unconditional twins) from the
+            # batch so they no longer cost backbone or depth compute.
+            kept_rows = {active[i] for i in keep}
+            keep_uncond = [
+                rows + j for j, row in enumerate(active_uncond) if row in kept_rows
+            ]
+            cache_keep = mx.array(keep + keep_uncond, dtype=mx.int32)
+            for layer_cache in cache:
+                layer_cache.filter(cache_keep)
+            hidden = hidden[cache_keep]
+            if penalize:
+                seen = seen[mx.array(keep, dtype=mx.int32)]
+            active = [active[i] for i in keep]
+            active_uncond = [row for row in active_uncond if row in kept_rows]
+            uncond_index, expand_index, scale = cfg_indices()
+            step_limit = max(token_caps[row] for row in active)
+            if verbose:
+                print(f"[breeze batch] step {steps}: {len(active)}/{count} rows active")
+
+        del cache, hidden, seen
+        elapsed = time.perf_counter() - started
+        if verbose:
+            total = sum(len(f) for f in frames)
+            print(
+                f"[breeze batch] {count} rows, {steps} steps, {total} frames "
+                f"in {elapsed:.2f}s"
+            )
+        for row in range(count):
+            if frames[row]:
+                codes = mx.array(frames[row], dtype=mx.int32)[None, :, :]
+                audio = self._decode_codes(codes)
+            else:
+                audio = self._empty_audio()
+            mx.eval(audio)
+            samples = int(audio.shape[0])
+            token_count = len(frames[row])
+            frames[row] = []
+            yield BatchGenerationResult(
+                audio=audio,
+                sequence_idx=row,
+                samples=samples,
+                sample_rate=self.sample_rate,
+                token_count=token_count,
+                audio_duration=f"00:00:{samples / self.sample_rate:06.3f}",
+                processing_time_seconds=time.perf_counter() - started,
+                peak_memory_usage=mx.get_peak_memory() / 1e9,
+            )
+        mx.clear_cache()

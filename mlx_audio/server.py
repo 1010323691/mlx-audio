@@ -185,6 +185,11 @@ class SpeechRequest(BaseModel):
     streaming_interval: float = 2.0
     max_tokens: int = 1200
     verbose: bool = False
+    # Classifier-free guidance for models that support it (e.g. Breeze TTS 2: an
+    # instruct only directs the voice when cfg_scale != 1). Omitted = model default.
+    cfg_scale: float | None = None
+    # Reproducible sampling where the model supports a seed. Omitted = random.
+    seed: int | None = None
 
 
 class TranscriptionRequest(BaseModel):
@@ -605,6 +610,8 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             speech_request.ref_text,
             speech_request.streaming_interval if speech_request.stream else None,
             speech_request.verbose,
+            speech_request.cfg_scale,
+            speech_request.seed,
         )
 
     def continuous_batch_key(self, request: InferenceRequest) -> Any:
@@ -679,6 +686,11 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             "max_tokens": speech_request.max_tokens,
             "verbose": speech_request.verbose,
         }
+        # Only when set: models without these options keep their exact call.
+        for name in ("cfg_scale", "seed"):
+            value = getattr(speech_request, name)
+            if value is not None:
+                generate_kwargs[name] = value
 
         for result in model.generate(speech_request.input, **generate_kwargs):
             if request.cancel_event.is_set():
@@ -755,6 +767,9 @@ class TTSExecutionAdapter(BaseModelExecutionAdapter):
             **_resolve_sampling_params(model, first_speech_request),
             "lang_code": first_speech_request.lang_code,
             "max_tokens": first_speech_request.max_tokens,
+            # Part of the batch key, so shared by every request of the batch.
+            "cfg_scale": first_speech_request.cfg_scale,
+            "seed": first_speech_request.seed,
             "stream": False,
             "verbose": first_speech_request.verbose,
         }
