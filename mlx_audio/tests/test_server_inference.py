@@ -179,3 +179,138 @@ def test_inference_broker_routes_continuous_batch_sessions():
         ]
     finally:
         broker.stop_and_join()
+
+
+class BatchingAdapter(BaseModelExecutionAdapter):
+    def __init__(self, max_batch_size=8, gather_s=0.0, gather_max_s=0.0):
+        self.max_batch_size = max_batch_size
+        self.batch_gather_s = gather_s
+        self.batch_gather_max_s = gather_max_s
+        self.batches = []
+
+    def supports_batch(self, request: InferenceRequest) -> bool:
+        del request
+        return True
+
+    def batch_key(self, request: InferenceRequest):
+        return request.payload[0]
+
+    def run_serial(self, request: InferenceRequest) -> None:
+        self.run_batch([request])
+
+    def run_batch(self, requests) -> None:
+        self.batches.append([request.payload for request in requests])
+        time.sleep(0.05)
+        for request in requests:
+            request.emit_data(request.payload)
+            request.emit_done()
+
+
+def _submit_staggered(broker, payloads, delay):
+    handles = []
+    for payload in payloads:
+        handles.append(
+            broker.submit(endpoint_kind="batch", model_name="m", payload=payload)
+        )
+        time.sleep(delay)
+    return handles
+
+
+def test_inference_broker_gathers_a_staggered_batch_into_one_call():
+    broker = InferenceBroker(idle_poll_s=0.01)
+    adapter = BatchingAdapter(max_batch_size=8, gather_s=0.2, gather_max_s=2.0)
+    broker.register_adapter("batch", adapter)
+    try:
+        handles = _submit_staggered(broker, [("a", i) for i in range(6)], 0.03)
+        for handle in handles:
+            _collect(handle)
+        assert adapter.batches == [[("a", i) for i in range(6)]]
+    finally:
+        broker.stop_and_join()
+
+
+def test_inference_broker_without_gather_window_starts_on_first_arrival():
+    broker = InferenceBroker(idle_poll_s=0.01)
+    adapter = BatchingAdapter(max_batch_size=8)
+    broker.register_adapter("batch", adapter)
+    try:
+        handles = _submit_staggered(broker, [("a", i) for i in range(4)], 0.03)
+        for handle in handles:
+            _collect(handle)
+        assert len(adapter.batches) > 1
+    finally:
+        broker.stop_and_join()
+
+
+def test_inference_broker_gather_stops_when_full_and_keeps_incompatible_requests():
+    broker = InferenceBroker(idle_poll_s=0.01)
+    # A long window: a full batch must start without waiting for it to run out.
+    adapter = BatchingAdapter(max_batch_size=3, gather_s=5.0, gather_max_s=5.0)
+    broker.register_adapter("batch", adapter)
+    try:
+        started = time.monotonic()
+        handles = _submit_staggered(
+            broker, [("a", 0), ("b", 0), ("a", 1), ("a", 2), ("a", 3)], 0.01
+        )
+        first = handles[0]
+        _collect(first)
+        assert time.monotonic() - started < 2.0
+        assert adapter.batches[0] == [("a", 0), ("a", 1), ("a", 2)]
+        for handle in handles[1:]:
+            _collect(handle, timeout=12.0)
+        assert sorted(sum(adapter.batches, [])) == sorted(
+            [("a", 0), ("b", 0), ("a", 1), ("a", 2), ("a", 3)]
+        )
+    finally:
+        broker.stop_and_join()
+
+
+def test_inference_broker_gather_window_has_an_overall_limit():
+    broker = InferenceBroker(idle_poll_s=0.01)
+    adapter = BatchingAdapter(max_batch_size=100, gather_s=0.2, gather_max_s=0.3)
+    broker.register_adapter("batch", adapter)
+    try:
+        handles = _submit_staggered(broker, [("a", i) for i in range(10)], 0.1)
+        for handle in handles:
+            _collect(handle)
+        assert len(adapter.batches) >= 2
+        assert sum(len(batch) for batch in adapter.batches) == 10
+    finally:
+        broker.stop_and_join()
+
+
+class PreflightAdapter(BaseModelExecutionAdapter):
+    run_while_gathering = True
+
+    def run_serial(self, request: InferenceRequest) -> None:
+        request.emit_done()
+
+
+def test_inference_broker_runs_preflight_jobs_while_gathering():
+    # Like the HTTP layer: each request first waits for a preflight broker job, then
+    # submits the real request. The gather window must run those preflights, or only
+    # the first request makes it into the batch.
+    broker = InferenceBroker(idle_poll_s=0.01)
+    adapter = BatchingAdapter(max_batch_size=8, gather_s=0.2, gather_max_s=2.0)
+    broker.register_adapter("batch", adapter)
+    broker.register_adapter("preflight", PreflightAdapter())
+    handles = [None] * 5
+
+    def client(i):
+        _collect(broker.submit(endpoint_kind="preflight", model_name="m", payload=None))
+        handles[i] = broker.submit(endpoint_kind="batch", model_name="m", payload=("a", i))
+
+    try:
+        threads = []
+        for i in range(5):
+            thread = threading.Thread(target=client, args=(i,))
+            thread.start()
+            threads.append(thread)
+            time.sleep(0.03)
+        for thread in threads:
+            thread.join(timeout=5)
+        for handle in handles:
+            _collect(handle)
+        assert adapter.batches == [[("a", i) for i in range(5)]]
+    finally:
+        broker.stop_and_join()

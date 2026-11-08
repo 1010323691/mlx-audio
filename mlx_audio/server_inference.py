@@ -64,10 +64,20 @@ class InferenceHandle:
 
 class ModelExecutionAdapter(Protocol):
     max_batch_size: int
+    # Fixed-window batching: after the first request of a batch, keep collecting
+    # compatible requests while new ones arrive at most ``batch_gather_s`` apart
+    # (bounded by ``batch_gather_max_s``) or until the batch is full, so a client
+    # that sends a whole batch at once has it executed as one batch. 0 = off.
+    batch_gather_s: float
+    batch_gather_max_s: float
 
     def supports_batch(self, request: InferenceRequest) -> bool: ...
 
     def batch_key(self, request: InferenceRequest) -> Any: ...
+
+    def is_batch_compatible(
+        self, request: InferenceRequest, candidate: InferenceRequest
+    ) -> bool: ...
 
     def run_serial(self, request: InferenceRequest) -> None: ...
 
@@ -95,6 +105,11 @@ class ContinuousBatchSession(Protocol):
 
 class BaseModelExecutionAdapter:
     max_batch_size = 1
+    batch_gather_s = 0.0
+    batch_gather_max_s = 0.0
+    # Quick jobs that other requests wait on before they are submitted (a model-load
+    # preflight): a batch gather window runs them instead of making them wait.
+    run_while_gathering = False
 
     def supports_batch(self, request: InferenceRequest) -> bool:
         del request
@@ -103,6 +118,11 @@ class BaseModelExecutionAdapter:
     def batch_key(self, request: InferenceRequest) -> Any:
         del request
         return None
+
+    def is_batch_compatible(
+        self, request: InferenceRequest, candidate: InferenceRequest
+    ) -> bool:
+        return candidate.batch_key == request.batch_key
 
     def run_serial(self, request: InferenceRequest) -> None:
         raise NotImplementedError
@@ -236,9 +256,7 @@ class InferenceBroker:
 
                 requests = [request]
                 if adapter.supports_batch(request) and adapter.max_batch_size > 1:
-                    requests.extend(
-                        self._select_batch_candidates(request, adapter, pending)
-                    )
+                    requests.extend(self._gather_batch(request, adapter, pending))
 
                 try:
                     if len(requests) > 1:
@@ -284,8 +302,11 @@ class InferenceBroker:
         request: InferenceRequest,
         adapter: ModelExecutionAdapter,
         pending: list[InferenceRequest],
+        compatible: Optional[list[InferenceRequest]] = None,
     ) -> list[InferenceRequest]:
-        compatible: list[InferenceRequest] = []
+        """Move compatible requests from ``pending`` into ``compatible`` (up to the
+        batch size, counting ``request`` itself) and return it."""
+        compatible = [] if compatible is None else compatible
         remaining: list[InferenceRequest] = []
         for candidate in pending:
             if len(compatible) >= adapter.max_batch_size - 1:
@@ -298,6 +319,73 @@ class InferenceBroker:
         pending[:] = remaining
         return compatible
 
+    def _gather_batch(
+        self,
+        request: InferenceRequest,
+        adapter: ModelExecutionAdapter,
+        pending: list[InferenceRequest],
+    ) -> list[InferenceRequest]:
+        """Compatible requests to run with ``request``. With a gather window, wait
+        for more while they keep arriving (each within ``batch_gather_s`` of the
+        last, all within ``batch_gather_max_s``) until the batch is full: a client
+        that sends a whole batch at once otherwise has its first arrivals start a
+        small batch while the rest wait for it to finish."""
+        compatible = self._select_batch_candidates(request, adapter, pending)
+        gap = float(getattr(adapter, "batch_gather_s", 0.0) or 0.0)
+        if gap <= 0:
+            return compatible
+        # A request that waits for a quick broker job first (the HTTP layer's model-load
+        # preflight) only arrives once that job has run: run such jobs right here.
+        pending[:] = self._run_inline_jobs(pending)
+        limit = max(gap, float(getattr(adapter, "batch_gather_max_s", 0.0) or 0.0))
+        deadline = time.monotonic() + limit
+        while (
+            len(compatible) < adapter.max_batch_size - 1
+            and not self._stop.is_set()
+            and not request.cancel_event.is_set()
+        ):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            arrived: list[InferenceRequest] = []
+            try:
+                item = self._requests.get(timeout=min(gap, remaining))
+            except queue.Empty:
+                break
+            while True:
+                if item is None:
+                    self._stop.set()
+                    break
+                arrived.append(item)
+                try:
+                    item = self._requests.get_nowait()
+                except queue.Empty:
+                    break
+            self._select_batch_candidates(request, adapter, arrived, compatible)
+            pending.extend(self._run_inline_jobs(arrived))
+        return [c for c in compatible if not c.cancel_event.is_set()]
+
+    def _run_inline_jobs(
+        self, requests: list[InferenceRequest]
+    ) -> list[InferenceRequest]:
+        """Run the requests whose adapter sets ``run_while_gathering`` (quick jobs
+        other requests wait on) and return the rest, in order."""
+        rest: list[InferenceRequest] = []
+        for job in requests:
+            adapter = self._adapters.get(job.endpoint_kind)
+            if adapter is None or not getattr(adapter, "run_while_gathering", False):
+                rest.append(job)
+                continue
+            if job.cancel_event.is_set():
+                continue
+            try:
+                adapter.run_serial(job)
+            except Exception as exc:  # pragma: no cover - defensive broker guard
+                traceback.print_exc()
+                job.emit_error(exc)
+                job.emit_done()
+        return rest
+
     def _is_batch_compatible(
         self,
         request: InferenceRequest,
@@ -308,7 +396,7 @@ class InferenceBroker:
             not candidate.cancel_event.is_set()
             and candidate.endpoint_kind == request.endpoint_kind
             and candidate.model_name == request.model_name
-            and candidate.batch_key == request.batch_key
+            and _adapter_batch_compatible(adapter, request, candidate)
             and adapter.supports_batch(candidate)
         )
 
@@ -356,3 +444,14 @@ class InferenceBroker:
 
             if session.idle:
                 self._continuous_sessions.pop(session_key, None)
+
+
+def _adapter_batch_compatible(
+    adapter: ModelExecutionAdapter,
+    request: InferenceRequest,
+    candidate: InferenceRequest,
+) -> bool:
+    check = getattr(adapter, "is_batch_compatible", None)
+    if callable(check):
+        return bool(check(request, candidate))
+    return candidate.batch_key == request.batch_key

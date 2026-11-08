@@ -1361,6 +1361,49 @@ def test_tts_batch_key_separates_cfg_scale_and_seed():
     assert key(seed=1) != key(seed=2)
 
 
+def test_tts_batch_compatibility_ignores_ref_clips_only_for_per_row_models():
+    from mlx_audio.server import TTSExecutionAdapter
+
+    adapter = TTSExecutionAdapter()
+    per_row = _tts_model_with_config(None)
+    per_row.batch_generate_per_row_refs = True
+    shared = _tts_model_with_config(None)
+    shared.batch_generate_per_row_refs = False
+
+    def pair(model, first, second):
+        a = _tts_inference_request(model, **first)
+        b = _tts_inference_request(model, **second)
+        a.batch_key, b.batch_key = adapter.batch_key(a), adapter.batch_key(b)
+        return adapter.is_batch_compatible(a, b)
+
+    one = {"ref_audio": "/tmp/a.wav", "ref_text": "a"}
+    two = {"ref_audio": "/tmp/b.wav", "ref_text": "b"}
+    assert pair(per_row, one, two)
+    assert pair(per_row, one, {})
+    assert not pair(shared, one, two)
+    assert pair(shared, one, dict(one))
+    # Everything else in the key still has to match.
+    assert not pair(per_row, {**one, "seed": 1}, {**two, "seed": 2})
+    assert not pair(per_row, {**one, "max_tokens": 10}, {**two, "max_tokens": 20})
+
+
+def test_tts_adapter_gather_window_from_env(monkeypatch):
+    from mlx_audio.server import TTSExecutionAdapter
+
+    adapter = TTSExecutionAdapter()
+    assert (adapter.batch_gather_s, adapter.batch_gather_max_s) == (0.25, 3.0)
+    monkeypatch.setenv("MLX_AUDIO_TTS_BATCH_GATHER_MS", "0")
+    monkeypatch.setenv("MLX_AUDIO_TTS_BATCH_GATHER_MAX_MS", "oops")
+    adapter = TTSExecutionAdapter()
+    assert (adapter.batch_gather_s, adapter.batch_gather_max_s) == (0.0, 3.0)
+
+
+def test_breeze_declares_per_row_reference_clips():
+    from mlx_audio.tts.models.breeze_tts.breeze_tts import Model
+
+    assert Model.batch_generate_per_row_refs is True
+
+
 def test_tts_batch_key_separates_omitted_from_sent_sampling():
     from mlx_audio.server import TTSExecutionAdapter
 
