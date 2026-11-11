@@ -392,6 +392,99 @@ def test_server_routes_breeze_requests_to_batch_generate():
     assert adapter.batch_key(plain) == adapter.batch_key(directed)
 
 
+def _full_prompt_prefill(model, rows, cfg_scale):
+    """Reference: the whole prompt of every row in one left-padded prefill."""
+    prompts = []
+    for text, instruct, ref_audio, ref_text in rows:
+        prompts.append(
+            model._prompt_embeddings(
+                text,
+                voice=None,
+                instruct=instruct,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+            )
+        )
+    for text, instruct, ref_audio, ref_text in rows:
+        if instruct and cfg_scale not in (None, 1.0):
+            prompts.append(
+                model._prompt_embeddings(
+                    text,
+                    voice=None,
+                    instruct=None,
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                )
+            )
+    width = max(int(p.shape[1]) for p in prompts)
+    pad = [width - int(p.shape[1]) for p in prompts]
+    embeddings = mx.concatenate(
+        [mx.pad(p, [(0, 0), (n, 0), (0, 0)]) for p, n in zip(prompts, pad)]
+    )
+    cache = model.backbone_model.make_batch_cache(pad)
+    hidden = model.backbone_model(
+        input_embeddings=embeddings, cache=cache, mask=model._prefill_mask(pad, width)
+    )[:, -1, :]
+    return hidden, cache
+
+
+def test_shared_prefix_prefill_matches_full_prompt_prefill(cpu, monkeypatch):
+    """Rows reuse their voice's prefix keys/values; nothing else changes.
+
+    Two voices with different clip and transcript lengths, rows without a
+    reference, targets shorter and longer than the block, and CFG rows
+    (which share the prefix of their conditional row).
+    """
+    model = _model(5)
+    long_clip, short_clip = mx.ones((400,)) * 0.3, mx.ones((240,)) * -0.2
+    rows = [
+        ("x", None, long_clip, "a long reference transcript here"),
+        ("short one", "warm", long_clip, "a long reference transcript here"),
+        ("a much longer target sentence than the rest", None, short_clip, "ref b"),
+        ("tiny", None, None, None),
+        ("another target of medium size", "sad", short_clip, "ref b"),
+        ("no reference but quite a long target text", None, None, None),
+    ]
+    cfg_scale = 2.0
+    instructs = [row[1] for row in rows]
+    use_cfg = [bool(ins) for ins in instructs]
+    widths = []
+    backbone_call = type(model.backbone_model).__call__
+
+    def record(self, *args, input_embeddings=None, **kwargs):
+        if input_embeddings is not None:
+            widths.append(tuple(input_embeddings.shape[:2]))
+        return backbone_call(self, *args, input_embeddings=input_embeddings, **kwargs)
+
+    monkeypatch.setattr(type(model.backbone_model), "__call__", record)
+    hidden, cache, owner = model._batch_prefill(
+        [row[0] for row in rows],
+        [None] * len(rows),
+        instructs,
+        [row[2] for row in rows],
+        [row[3] for row in rows],
+        use_cfg,
+    )
+    assert owner == [1, 4]
+    # One prefill per distinct prefix (2 voices), then the batched block of
+    # all 8 cache rows, which is much narrower than the whole prompts.
+    assert len(widths) == 2 and widths[0][0] == 2 and widths[1][0] == 8
+    expected_hidden, expected_cache = _full_prompt_prefill(model, rows, cfg_scale)
+    assert widths[1][1] < widths[2][1] / 2
+    assert cache[0].offset.tolist() == expected_cache[0].offset.tolist()
+    assert mx.allclose(hidden, expected_hidden, atol=1e-5).item()
+
+    # The caches must also agree for everything that comes after the prompt.
+    frame = mx.array(
+        [[[(r + c) % 8 for c in range(model.num_codebooks)]] for r in range(8)],
+        dtype=mx.int32,
+    )
+    for _ in range(3):
+        step = model.backbone_model(input_ids=frame, cache=cache)[:, -1, :]
+        expected = model.backbone_model(input_ids=frame, cache=expected_cache)[:, -1, :]
+        assert mx.allclose(step, expected, atol=1e-5).item()
+
+
 def test_prefill_mask_hides_left_padding_without_empty_rows():
     mask = Model._prefill_mask([0, 2], 4)
     assert mask.shape == (2, 1, 4, 4)

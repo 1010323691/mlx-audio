@@ -1471,15 +1471,19 @@ class Model(nn.Module):
         return [values] * count
 
     @staticmethod
-    def _prefill_mask(left_padding: list[int], length: int) -> mx.array:
+    def _prefill_mask(
+        left_padding: list[int], length: int, offset: int = 0
+    ) -> mx.array:
         """Causal mask that hides each row's left padding.
 
-        Padded query positions may still attend to themselves so that no
-        softmax row is fully masked (which would put NaNs into the padded
-        key/value slots of later layers); real positions never see padding.
+        The ``length`` queries sit after ``offset`` positions already in the
+        cache.  Padded query positions may still attend to themselves so
+        that no softmax row is fully masked (which would put NaNs into the
+        padded key/value slots of later layers); real positions never see
+        padding.
         """
-        query = mx.arange(length)[:, None]
-        key = mx.arange(length)[None, :]
+        query = mx.arange(offset, offset + length)[:, None]
+        key = mx.arange(offset + length)[None, :]
         pad = mx.array(left_padding, dtype=mx.int32)[:, None, None, None]
         visible = (query >= key) & (key >= pad)
         return visible | (query == key)
@@ -1555,6 +1559,14 @@ class Model(nn.Module):
         Cache rows are the conditional rows in input order followed by one
         unconditional row per CFG row (``uncond_owner`` gives its input row).
         Returns the last hidden state of every cache row and the cache.
+
+        A prompt is ``[reference prefix | target text]`` and every row of one
+        voice has the same prefix, so the backbone runs each distinct prefix
+        once and copies its keys/values into the rows.  Only the last
+        ``block`` positions of every prompt (``block`` = longest target; a
+        shorter target is topped up with the end of its prefix) go through
+        the batched prefill on top of that.  The backbone is causal, so the
+        copied keys/values are the ones the row would have computed itself.
         """
         # Encode each distinct reference clip once per call.
         encoded_refs: dict[Any, mx.array] = {}
@@ -1608,33 +1620,138 @@ class Model(nn.Module):
         text_embeddings = self._encode_texts(
             [value for prompt in segments for kind, value in prompt if kind == "text"]
         )
-        all_prompts = [
-            self._embed_segments(prompt, text_embeddings) for prompt in segments
-        ]
-        del text_embeddings
-        lengths = [int(p.shape[1]) for p in all_prompts]
-        width = max(lengths)
-        left_padding = [width - length for length in lengths]
-        padded = [
-            (
-                mx.concatenate(
-                    [mx.zeros((1, pad, p.shape[-1]), dtype=p.dtype), p], axis=1
-                )
-                if pad
-                else p
+        # Split every prompt into its (shared) prefix and its target text.
+        prefix_index: dict[tuple, int] = {}
+        prefixes: list[mx.array] = []
+        row_prefix: list[int] = []  # index into ``prefixes``; -1 = no prefix
+        targets: list[mx.array] = []
+        for prompt in segments:
+            *head, (_, target) = prompt
+            targets.append(text_embeddings[target])
+            if not head:
+                row_prefix.append(-1)
+                continue
+            key = tuple(
+                value if kind == "text" else ("audio", id(value))
+                for kind, value in head
             )
-            for p, pad in zip(all_prompts, left_padding)
-        ]
-        embeddings = mx.concatenate(padded, axis=0)
-        del cond_prompts, uncond_prompts, all_prompts, padded
+            if key not in prefix_index:
+                prefix_index[key] = len(prefixes)
+                prefixes.append(self._embed_segments(head, text_embeddings))
+            row_prefix.append(prefix_index[key])
+        del text_embeddings, cond_prompts, uncond_prompts, segments
 
-        cache = self.backbone_model.make_batch_cache(left_padding)
+        prefix_len = [int(p.shape[1]) for p in prefixes]
+        totals = [
+            (prefix_len[u] if u >= 0 else 0) + int(t.shape[1])
+            for u, t in zip(row_prefix, targets)
+        ]
+        block = max(int(t.shape[1]) for t in targets)
+        # ``kept``: prefix positions copied from the shared prefix cache;
+        # ``block_pad``: left padding inside the block (prompt < block).
+        kept = [max(0, total - block) for total in totals]
+        block_pad = [max(0, block - total) for total in totals]
+        shared = max(kept)
+        left_padding = [shared - k + pad for k, pad in zip(kept, block_pad)]
+        cache = self._shared_prefix_cache(prefixes, row_prefix, kept, block_pad, block)
+
+        pieces = []
+        for u, k, pad, target in zip(row_prefix, kept, block_pad, targets):
+            parts = []
+            if pad:
+                parts.append(mx.zeros((1, pad, target.shape[-1]), dtype=target.dtype))
+            if u >= 0 and prefix_len[u] > k:
+                parts.append(prefixes[u][:, k:])
+            parts.append(target)
+            pieces.append(mx.concatenate(parts, axis=1))
+        embeddings = mx.concatenate(pieces, axis=0)
+        del pieces, prefixes, targets
+
         hidden = self.backbone_model(
             input_embeddings=embeddings,
             cache=cache,
-            mask=self._prefill_mask(left_padding, width),
+            mask=self._prefill_mask(left_padding, block, offset=shared),
         )[:, -1, :]
         return hidden, cache, uncond_owner
+
+    def _shared_prefix_cache(
+        self,
+        prefixes: list[mx.array],
+        row_prefix: list[int],
+        kept: list[int],
+        block_pad: list[int],
+        block: int,
+    ) -> list[BatchKVCache]:
+        """Backbone cache holding each row's first ``kept`` prefix positions.
+
+        Each distinct prefix runs through the backbone once (only as far as
+        its rows need), then its keys/values are gathered into the rows,
+        right-aligned at ``shared = max(kept)`` with the rest left-padded.
+        The buffers are sized for the following ``block`` positions, as a
+        prefill of the whole prompt would have allocated them.
+        """
+        rows = len(row_prefix)
+        shared = max(kept)
+        left_padding = [shared - k + pad for k, pad in zip(kept, block_pad)]
+        if shared == 0:
+            return self.backbone_model.make_batch_cache(left_padding)
+
+        need = [0] * len(prefixes)
+        for u, k in zip(row_prefix, kept):
+            if u >= 0:
+                need[u] = max(need[u], k)
+        used = [u for u in range(len(prefixes)) if need[u]]
+        slot = {u: j for j, u in enumerate(used)}
+        width = max(need)
+        pad = [width - need[u] for u in used]
+        prefix_cache = self.backbone_model.make_batch_cache(pad)
+        self.backbone_model(
+            input_embeddings=mx.concatenate(
+                [
+                    mx.pad(prefixes[u][:, : need[u]], [(0, 0), (p, 0), (0, 0)])
+                    for u, p in zip(used, pad)
+                ],
+                axis=0,
+            ),
+            cache=prefix_cache,
+            mask=self._prefill_mask(pad, width),
+        )
+
+        # Row r, slot t < shared holds prefix position t - (shared - kept[r])
+        # of its voice; earlier slots are padding (masked; any finite value).
+        position = mx.arange(shared)[None, :]
+        start = mx.array([shared - k for k in kept])[:, None]
+        source_row = mx.array(
+            [slot.get(u, 0) if k else 0 for u, k in zip(row_prefix, kept)]
+        )[:, None]
+        source_start = mx.array(
+            [width - need[u] if k else 0 for u, k in zip(row_prefix, kept)]
+        )[:, None]
+        flat = mx.where(
+            position >= start,
+            source_row * width + source_start + position - start,
+            0,
+        ).reshape(-1)
+        capacity = -(-(shared + block) // BatchKVCache.step) * BatchKVCache.step
+
+        def gather(states: mx.array) -> mx.array:
+            # [prefixes, heads, width, dim] -> [rows, heads, capacity, dim]
+            _, heads, _, dim = states.shape
+            states = states.transpose(0, 2, 1, 3).reshape(-1, heads, dim)
+            states = states[flat].reshape(rows, shared, heads, dim)
+            states = states.transpose(0, 2, 1, 3)
+            return mx.pad(states, [(0, 0), (0, 0), (0, capacity - shared), (0, 0)])
+
+        cache = []
+        for layer_cache in prefix_cache:
+            keys, values, _, _ = layer_cache.state
+            row_cache = BatchKVCache(left_padding)
+            row_cache.keys = gather(keys)
+            row_cache.values = gather(values)
+            row_cache.offset = mx.array([k - p for k, p in zip(kept, block_pad)])
+            row_cache._idx = shared
+            cache.append(row_cache)
+        return cache
 
     def batch_generate(
         self,
