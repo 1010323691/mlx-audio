@@ -15,8 +15,10 @@ from mlx_audio.tts.models.qwen3_tts.speaker_encoder import (
 )
 from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import (
     DecoderBlockUpsample,
+    DecoderOutputSnake,
     DecoderTransformer,
     Qwen3TTSSpeechTokenizerDecoder,
+    SnakeBeta,
 )
 
 
@@ -1001,6 +1003,25 @@ class TestQwen3TTSBaseVoiceValidation(unittest.TestCase):
         results = list(model.generate(text="Hello", voice="vivian", max_tokens=1))
 
         self.assertTrue(results)
+
+
+class TestSnakeActivation(unittest.TestCase):
+    """The compiled snake equals the eager formula for any shape."""
+
+    def test_matches_eager_formula(self):
+        mx.random.seed(0)
+        for cls in (SnakeBeta, DecoderOutputSnake):
+            act = cls(8)
+            act.alpha = mx.random.normal((8,)) * 0.3
+            act.beta = mx.random.normal((8,)) * 0.3
+            for shape in ((1, 5, 8), (2, 300, 8), (3, 1, 8)):
+                x = mx.random.normal(shape)
+                expected = x + (1.0 / (mx.exp(act.beta) + 1e-9)) * mx.power(
+                    mx.sin(x * mx.exp(act.alpha)), 2
+                )
+                np.testing.assert_allclose(
+                    np.array(act(x)), np.array(expected), rtol=1e-5, atol=1e-5
+                )
 
 
 class TestDecoderBlockUpsampleStreaming(unittest.TestCase):

@@ -3,6 +3,7 @@
 
 import math
 import re
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -108,6 +109,17 @@ class CausalTransposeConv1d(nn.Module):
         return x
 
 
+@partial(mx.compile, shapeless=True)
+def _snake_beta(x: mx.array, alpha: mx.array, beta: mx.array) -> mx.array:
+    """``x + 1/exp(beta) * sin^2(x * exp(alpha))`` as one fused kernel.
+
+    Eagerly this is five element-wise passes over the activations, which
+    are large at the decoder's audio-rate stages.  The ``1e-9`` guard is
+    the original ``eps``.
+    """
+    return x + (1.0 / (mx.exp(beta) + 1e-9)) * mx.power(mx.sin(x * mx.exp(alpha)), 2)
+
+
 class SnakeBeta(nn.Module):
     """Snake activation with learnable alpha and beta parameters.
 
@@ -122,9 +134,7 @@ class SnakeBeta(nn.Module):
         self.eps = 1e-9
 
     def __call__(self, x: mx.array) -> mx.array:
-        alpha = mx.exp(self.alpha)
-        beta = mx.exp(self.beta)
-        return x + (1.0 / (beta + self.eps)) * mx.power(mx.sin(x * alpha), 2)
+        return _snake_beta(x, self.alpha, self.beta)
 
 
 class ConvNeXtBlock(nn.Module):
@@ -776,9 +786,7 @@ class DecoderOutputSnake(nn.Module):
         self.eps = 1e-9
 
     def __call__(self, x: mx.array) -> mx.array:
-        alpha = mx.exp(self.alpha)
-        beta = mx.exp(self.beta)
-        return x + (1.0 / (beta + self.eps)) * mx.power(mx.sin(x * alpha), 2)
+        return _snake_beta(x, self.alpha, self.beta)
 
 
 class DecoderOutputConv(nn.Module):
