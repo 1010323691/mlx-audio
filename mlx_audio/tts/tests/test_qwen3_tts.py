@@ -1006,6 +1006,12 @@ class TestQwen3TTSBaseVoiceValidation(unittest.TestCase):
 class TestDecoderBlockUpsampleStreaming(unittest.TestCase):
     """Tests for DecoderBlockUpsample streaming (step) against the full call."""
 
+    # MLX's float32 matrix-matrix kernels on Apple GPUs round to about 1e-3
+    # relative error, while a one-row input takes the exact matrix-vector
+    # kernel; the block's matmul form therefore differs by ~1e-3 between
+    # chunk sizes.  A doubled or missing bias (magnitude ~1) still fails.
+    ATOL = 5e-3
+
     def _block(self, upsample_rate):
         mx.random.seed(0)
         block = DecoderBlockUpsample(in_dim=6, out_dim=5, upsample_rate=upsample_rate)
@@ -1022,6 +1028,22 @@ class TestDecoderBlockUpsampleStreaming(unittest.TestCase):
         self.assertEqual(start, x.shape[1])
         return mx.concatenate(out, axis=1)
 
+    def test_matmul_form_matches_conv_transpose(self):
+        """The matmul + overlap-add form equals nn.ConvTranspose1d."""
+        for upsample_rate in (2, 3, 4, 5, 8):
+            block = self._block(upsample_rate)
+            for frames in (1, 2, 13):
+                x = mx.random.normal((2, frames, 6))
+                expected = block.conv(x)[:, : -block.trim_right, :]
+                actual = block(x)
+                self.assertEqual(actual.shape, expected.shape)
+                np.testing.assert_allclose(
+                    np.array(actual),
+                    np.array(expected),
+                    atol=self.ATOL,
+                    err_msg=f"upsample_rate={upsample_rate}, frames={frames}",
+                )
+
     def test_step_matches_full_call_for_any_chunking(self):
         """Test that streaming in any chunk sizes matches one call."""
         for upsample_rate in (2, 4, 8):
@@ -1034,7 +1056,7 @@ class TestDecoderBlockUpsampleStreaming(unittest.TestCase):
                 np.testing.assert_allclose(
                     np.array(streamed),
                     np.array(full),
-                    atol=1e-5,
+                    atol=self.ATOL,
                     err_msg=f"upsample_rate={upsample_rate}, chunks={chunks}",
                 )
 

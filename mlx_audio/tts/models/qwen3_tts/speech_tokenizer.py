@@ -640,16 +640,38 @@ class DecoderBlockUpsample(nn.Module):
         self.trim_right = kernel_size - upsample_rate
         self._overflow = None  # Overlap-add buffer for streaming
 
+    def _transpose_conv(self, x: mx.array) -> mx.array:
+        """``self.conv(x)`` computed as one matmul plus an overlap-add.
+
+        The kernel spans exactly two strides, so every output frame of
+        ``stride`` samples is the first half of one input frame's
+        projection plus the second half of the previous one.  This is the
+        same sum as the transposed convolution (only the summation order
+        differs) and is several times faster than ``nn.ConvTranspose1d``.
+        """
+        weight = self.conv.weight  # [out, kernel, in]
+        out_dim, kernel, in_dim = weight.shape
+        stride = kernel // 2
+        batch, frames, _ = x.shape
+        y = x @ weight.reshape(out_dim * kernel, in_dim).T
+        y = y.reshape(batch, frames, out_dim, kernel).transpose(0, 1, 3, 2)
+        head = mx.pad(y[:, :, :stride], [(0, 0), (0, 1), (0, 0), (0, 0)])
+        tail = mx.pad(y[:, :, stride:], [(0, 0), (1, 0), (0, 0), (0, 0)])
+        y = (head + tail).reshape(batch, (frames + 1) * stride, out_dim)
+        if "bias" in self.conv:
+            y = y + self.conv.bias
+        return y
+
     def __call__(self, x: mx.array) -> mx.array:
         # x: [batch, time, channels] (NLC format)
-        x = self.conv(x)
+        x = self._transpose_conv(x)
         if self.trim_right > 0:
             x = x[:, : -self.trim_right, :]
         return x
 
     def step(self, x: mx.array) -> mx.array:
         """Streaming step with overlap-add for ConvTranspose1d."""
-        y = self.conv(x)
+        y = self._transpose_conv(x)
         if self._overflow is not None:
             ov_len = self._overflow.shape[1]
             y = mx.concatenate(
