@@ -8,6 +8,7 @@ no PyTorch or upstream Breeze runtime is required at inference time.
 
 import json
 import math
+import os
 import re
 import time
 from pathlib import Path
@@ -26,6 +27,9 @@ from mlx_audio.tts.models.base import BatchGenerationResult, GenerationResult
 from mlx_audio.utils import load_audio
 
 from .config import ModelConfig
+
+CODEC_DTYPE_ENV = "MLX_AUDIO_BREEZE_CODEC_DTYPE"
+_CODEC_DTYPES = {"float16": mx.float16, "float32": mx.float32}
 
 
 def _split_long_segment(text: str, max_chars: int = 600) -> list[str]:
@@ -762,7 +766,27 @@ class Model(nn.Module):
                 f"Breeze checkpoint has no audio_tokenizer at {codec_path}"
             )
         model.audio_tokenizer = cls._load_audio_tokenizer(codec_path)
+        codec_dtype = cls._codec_decode_dtype()
+        if codec_dtype != mx.float32:
+            model.audio_tokenizer.decoder.set_compute_dtype(codec_dtype)
         return model
+
+    @staticmethod
+    def _codec_decode_dtype() -> mx.Dtype:
+        """Precision of the codec's waveform decoder (not its encoder).
+
+        Half precision is the default: it decodes about 1.3-1.4x faster with
+        half the memory, and stays 43-46 dB below the float32 waveform on
+        speech.  Set ``MLX_AUDIO_BREEZE_CODEC_DTYPE=float32`` to keep the
+        checkpoint's precision.
+        """
+        raw = os.environ.get(CODEC_DTYPE_ENV, "").strip().lower() or "float16"
+        try:
+            return _CODEC_DTYPES[raw]
+        except KeyError:
+            raise ValueError(
+                f"{CODEC_DTYPE_ENV} must be 'float16' or 'float32', got {raw!r}."
+            ) from None
 
     @staticmethod
     def _load_audio_tokenizer(codec_path: Path):

@@ -8,6 +8,7 @@ except (ImportError, RuntimeError) as exc:  # pragma: no cover - no Metal host
     pytest.skip(f"MLX device unavailable: {exc}", allow_module_level=True)
 
 from mlx_audio.tts.models.breeze_tts.breeze_tts import (
+    CODEC_DTYPE_ENV,
     Model,
     _split_long_segment,
     _t5gemma2_attention_mask,
@@ -507,3 +508,52 @@ def test_breeze_generate_preserves_existing_positional_arguments():
     assert bound.arguments["temperature"] == 0.4
     assert bound.arguments["streaming_interval"] == 0.5
     assert "split_pattern" not in bound.arguments
+
+
+def test_codec_decoder_defaults_to_half_precision(monkeypatch):
+    monkeypatch.delenv(CODEC_DTYPE_ENV, raising=False)
+    assert Model._codec_decode_dtype() == mx.float16
+    monkeypatch.setenv(CODEC_DTYPE_ENV, "")
+    assert Model._codec_decode_dtype() == mx.float16
+    monkeypatch.setenv(CODEC_DTYPE_ENV, " Float32 ")
+    assert Model._codec_decode_dtype() == mx.float32
+    monkeypatch.setenv(CODEC_DTYPE_ENV, "bfloat16")
+    with pytest.raises(ValueError, match=CODEC_DTYPE_ENV):
+        Model._codec_decode_dtype()
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [(None, [mx.float16]), ("float16", [mx.float16]), ("float32", [])],
+)
+def test_post_load_hook_applies_codec_decode_dtype(
+    monkeypatch, tmp_path, value, expected
+):
+    import transformers
+
+    (tmp_path / "tokenizer_config.json").write_text("{}")
+    (tmp_path / "audio_tokenizer").mkdir()
+    monkeypatch.setattr(
+        transformers, "PreTrainedTokenizerFast", lambda **_kwargs: object()
+    )
+    applied = []
+
+    class Decoder:
+        def set_compute_dtype(self, dtype):
+            applied.append(dtype)
+
+    class Codec:
+        decoder = Decoder()
+
+    monkeypatch.setattr(
+        Model, "_load_audio_tokenizer", staticmethod(lambda _path: Codec())
+    )
+    if value is None:
+        monkeypatch.delenv(CODEC_DTYPE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(CODEC_DTYPE_ENV, value)
+
+    model = Model.post_load_hook(Model(tiny_config()), tmp_path)
+
+    assert isinstance(model.audio_tokenizer, Codec)
+    assert applied == expected

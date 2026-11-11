@@ -16,6 +16,7 @@ from mlx_audio.tts.models.qwen3_tts.speaker_encoder import (
 from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import (
     DecoderBlockUpsample,
     DecoderTransformer,
+    Qwen3TTSSpeechTokenizerDecoder,
 )
 
 
@@ -1189,6 +1190,109 @@ class TestQwen3TTSICLStreamingPriming(unittest.TestCase):
 
         self.assertEqual(len(decoder.step_inputs), 3)
         self.assertEqual(decoder.step_inputs[0].shape, (1, 1, 1))
+
+
+class TestDecoderComputeDtype(unittest.TestCase):
+    """set_compute_dtype keeps the activations, not just the weights, in half."""
+
+    def setUp(self):
+        mx.random.seed(0)
+        config = Qwen3TTSTokenizerDecoderConfig(
+            latent_dim=16,
+            codebook_dim=8,
+            codebook_size=32,
+            decoder_dim=32,
+            hidden_size=16,
+            intermediate_size=32,
+            head_dim=4,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            num_hidden_layers=2,
+            num_quantizers=4,
+            layer_scale_initial_scale=1.0,
+            upsample_rates=[2, 2],
+            upsampling_ratios=[2],
+        )
+        self.decoder = Qwen3TTSSpeechTokenizerDecoder(config)
+        self.codes = mx.random.randint(0, 32, (2, 4, 12))
+
+    def _probe_last_layer(self):
+        seen = []
+        last = self.decoder.decoder[-1]
+
+        class Probe:
+            def __call__(self, x):
+                seen.append(x.dtype)
+                return last(x)
+
+            def step(self, x):
+                seen.append(x.dtype)
+                return last.step(x)
+
+        self.decoder.decoder[-1] = Probe()
+        return seen
+
+    def test_untouched_decoder_stays_float32(self):
+        seen = self._probe_last_layer()
+        self.assertEqual(self.decoder(self.codes).dtype, mx.float32)
+        self.assertEqual(seen, [mx.float32])
+
+    def test_half_precision_matches_float32(self):
+        expected = np.array(self.decoder(self.codes))
+        self.decoder.set_compute_dtype(mx.float16)
+        self.assertEqual(self.decoder.pre_conv.conv.weight.dtype, mx.float16)
+        seen = self._probe_last_layer()
+
+        wav = self.decoder(self.codes)
+
+        self.assertEqual(seen, [mx.float16])
+        self.assertEqual(wav.dtype, mx.float32)
+        self.assertEqual(wav.shape, expected.shape)
+        self.assertGreater(np.abs(expected).max(), 0)
+        np.testing.assert_allclose(
+            np.array(wav), expected, atol=2e-2 * np.abs(expected).max()
+        )
+
+    def test_activations_follow_a_later_set_dtype(self):
+        self.decoder.set_compute_dtype(mx.float16)
+        self.decoder.set_dtype(mx.float32)
+        seen = self._probe_last_layer()
+
+        self.assertEqual(self.decoder(self.codes).dtype, mx.float32)
+        self.assertEqual(seen, [mx.float32])
+
+    def test_set_compute_dtype_resets_an_open_stream(self):
+        self.decoder.streaming_step(self.codes[..., :4])
+        self.assertIsNotNone(self.decoder._transformer_cache)
+
+        self.decoder.set_compute_dtype(mx.float16)
+
+        self.assertIsNone(self.decoder._transformer_cache)
+        self.assertIsNone(self.decoder.pre_conv._buffer)
+        self.assertEqual(
+            self.decoder.streaming_step(self.codes[..., :4]).dtype, mx.float32
+        )
+        self.decoder.reset_streaming_state()
+
+    def test_half_precision_streaming_matches_full_decode(self):
+        self.decoder.set_compute_dtype(mx.float16)
+        full = np.array(self.decoder(self.codes))
+        seen = self._probe_last_layer()
+
+        self.decoder.reset_streaming_state()
+        chunks = [
+            self.decoder.streaming_step(self.codes[..., start : start + 4])
+            for start in range(0, 12, 4)
+        ]
+        self.decoder.reset_streaming_state()
+
+        self.assertEqual(seen, [mx.float16] * 3)
+        self.assertTrue(all(chunk.dtype == mx.float32 for chunk in chunks))
+        np.testing.assert_allclose(
+            np.array(mx.concatenate(chunks, axis=-1)),
+            full,
+            atol=2e-2 * np.abs(full).max(),
+        )
 
 
 if __name__ == "__main__":
