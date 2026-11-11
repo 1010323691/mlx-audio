@@ -892,6 +892,28 @@ class Model(nn.Module):
         ``ref_audio`` (``[1, frames, codebooks]``) instead of re-running the
         codec encoder for every row that shares a reference clip.
         """
+        return self._embed_segments(
+            self._prompt_segments(
+                text,
+                voice=voice,
+                instruct=instruct,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                reference_codes=reference_codes,
+            )
+        )
+
+    def _prompt_segments(
+        self,
+        text: str,
+        *,
+        voice: Optional[str],
+        instruct: Optional[str],
+        ref_audio: Optional[Union[str, Path, mx.array]],
+        ref_text: Optional[str],
+        reference_codes: Optional[mx.array] = None,
+    ) -> list[tuple[str, Any]]:
+        """A prompt as ``("text", string)`` / ``("audio", codes)`` segments."""
         if isinstance(ref_audio, (list, tuple)):
             if len(ref_audio) != 1:
                 raise ValueError(
@@ -907,9 +929,9 @@ class Model(nn.Module):
         if ref_audio is not None and not ref_text:
             raise ValueError("Breeze voice cloning requires ref_text with ref_audio.")
         speaker = self._speaker(voice)
-        segments: list[tuple[str, mx.array]] = []
+        segments: list[tuple[str, Any]] = []
         if ref_audio is not None:
-            segments.append(("text", self._text_ids(f"{speaker}{ref_text}")))
+            segments.append(("text", f"{speaker}{ref_text}"))
             segments.append(
                 (
                     "audio",
@@ -923,12 +945,27 @@ class Model(nn.Module):
         target = f"{speaker}{text}"
         if instruct:
             target = f"{speaker}<ins_bos>{instruct}<ins_eos>{text}"
-        segments.append(("text", self._text_ids(target)))
+        segments.append(("text", target))
+        return segments
 
+    def _embed_segments(
+        self,
+        segments: list[tuple[str, Any]],
+        text_embeddings: Optional[dict[str, mx.array]] = None,
+    ) -> mx.array:
+        """Concatenate segment embeddings into ``[1, length, hidden]``.
+
+        ``text_embeddings`` maps each text segment to its already encoded
+        ``[1, tokens, hidden]`` embedding (see ``_encode_texts``); without
+        it every text segment is encoded on its own.
+        """
         embeddings: list[mx.array] = []
         for kind, values in segments:
             if kind == "text":
-                hidden = self.text_encoder(values[None, :])
+                if text_embeddings is not None:
+                    embeddings.append(text_embeddings[values])
+                    continue
+                hidden = self.text_encoder(self._text_ids(values)[None, :])
                 embeddings.append(self.text_encoder_proj(hidden))
             else:
                 embeddings.append(self.backbone_model.embed_tokens(values))
@@ -937,6 +974,34 @@ class Model(nn.Module):
                 )
                 embeddings.append(self.backbone_model.embed_tokens(eos_codes))
         return mx.concatenate(embeddings, axis=1)
+
+    def _encode_texts(self, strings: list[str], chunk: int = 64) -> dict[str, mx.array]:
+        """Encode each distinct string once, in right-padded batches.
+
+        Returns ``{string: [1, tokens, hidden]}``, the projected text-encoder
+        output that ``_embed_segments`` concatenates.  The encoder is
+        bidirectional, so padding is hidden with its attention mask; rows
+        are grouped by token count to keep the padding small.
+        """
+        ids = {text: self._text_ids(text) for text in dict.fromkeys(strings)}
+        order = sorted(ids, key=lambda text: int(ids[text].shape[0]))
+        encoded: dict[str, mx.array] = {}
+        for start in range(0, len(order), chunk):
+            part = order[start : start + chunk]
+            lengths = [int(ids[text].shape[0]) for text in part]
+            width = max(lengths)
+            tokens = mx.stack(
+                [mx.pad(ids[text], (0, width - n)) for text, n in zip(part, lengths)]
+            )
+            mask = (mx.arange(width)[None, :] < mx.array(lengths)[:, None]).astype(
+                mx.int32
+            )
+            hidden = self.text_encoder_proj(
+                self.text_encoder(tokens, attention_mask=mask)
+            )
+            for row, (text, n) in enumerate(zip(part, lengths)):
+                encoded[text] = hidden[row : row + 1, :n]
+        return encoded
 
     def _sample(
         self,
@@ -1513,8 +1578,8 @@ class Model(nn.Module):
             return encoded_refs[key]
 
         # Cache rows are [conditional rows..., unconditional CFG rows...].
-        cond_prompts: list[mx.array] = []
-        uncond_prompts: list[mx.array] = []
+        cond_prompts: list[list[tuple[str, Any]]] = []
+        uncond_prompts: list[list[tuple[str, Any]]] = []
         uncond_owner: list[int] = []
         for row, text in enumerate(texts):
             text = text.strip() or text
@@ -1530,14 +1595,23 @@ class Model(nn.Module):
                 reference_codes=codes,
             )
             cond_prompts.append(
-                self._prompt_embeddings(text, instruct=instructs[row], **prompt_kwargs)
+                self._prompt_segments(text, instruct=instructs[row], **prompt_kwargs)
             )
             if use_cfg[row]:
                 uncond_prompts.append(
-                    self._prompt_embeddings(text, instruct=None, **prompt_kwargs)
+                    self._prompt_segments(text, instruct=None, **prompt_kwargs)
                 )
                 uncond_owner.append(row)
-        all_prompts = cond_prompts + uncond_prompts
+        # Encode every distinct text segment once, batched: rows that share
+        # a reference transcript reuse its encoding.
+        segments = cond_prompts + uncond_prompts
+        text_embeddings = self._encode_texts(
+            [value for prompt in segments for kind, value in prompt if kind == "text"]
+        )
+        all_prompts = [
+            self._embed_segments(prompt, text_embeddings) for prompt in segments
+        ]
+        del text_embeddings
         lengths = [int(p.shape[1]) for p in all_prompts]
         width = max(lengths)
         left_padding = [width - length for length in lengths]
