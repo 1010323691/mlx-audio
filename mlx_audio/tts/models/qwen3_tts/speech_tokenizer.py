@@ -804,6 +804,8 @@ class Qwen3TTSSpeechTokenizerDecoder(nn.Module):
 
         # Streaming state
         self._transformer_cache = None
+        # Set by ``set_compute_dtype``; off leaves dtypes untouched.
+        self._cast_activations = False
 
         # Transformer
         self.pre_transformer = DecoderTransformer(config)
@@ -849,6 +851,32 @@ class Qwen3TTSSpeechTokenizerDecoder(nn.Module):
             DecoderOutputConv(output_dim, 7),  # [6]
         ]
 
+    def set_compute_dtype(self, dtype: mx.Dtype) -> None:
+        """Run the decoder in ``dtype``: weights and activations.
+
+        Casting the weights alone is not enough: the float32 rotary tables
+        of the transformer promote everything after them back to float32.
+        The activations are therefore cast after the codebook lookup and
+        after the transformer.  The waveform is always returned as float32.
+        Going from float16 back to float32 does not restore the original
+        weights; reload the codec for that.  Any stream in progress is reset.
+        """
+        self.set_dtype(dtype)
+        self._cast_activations = True
+        self.reset_streaming_state()
+
+    def _to_compute_dtype(self, x: mx.array) -> mx.array:
+        if not self._cast_activations:
+            return x
+        # Follow the weights, so a later ``set_dtype`` cannot leave the
+        # activations in a different precision.
+        return x.astype(self.pre_conv.conv.weight.dtype)
+
+    def _to_output_dtype(self, wav: mx.array) -> mx.array:
+        if not self._cast_activations:
+            return wav
+        return wav.astype(mx.float32)
+
     def __call__(self, codes: mx.array) -> mx.array:
         """
         Args:
@@ -863,7 +891,7 @@ class Qwen3TTSSpeechTokenizerDecoder(nn.Module):
             )
 
         # Dequantize: [batch, codebook_dim, time] (NCL)
-        hidden = self.quantizer.decode(codes)
+        hidden = self._to_compute_dtype(self.quantizer.decode(codes))
         # Convert to NLC for the entire decoder pipeline
         hidden = mx.transpose(hidden, (0, 2, 1))  # [batch, time, codebook_dim]
 
@@ -871,7 +899,7 @@ class Qwen3TTSSpeechTokenizerDecoder(nn.Module):
         hidden = self.pre_conv(hidden)  # [batch, time, latent_dim]
 
         # Transformer (already expects NLC)
-        hidden = self.pre_transformer(hidden)
+        hidden = self._to_compute_dtype(self.pre_transformer(hidden))
 
         # Upsampling (NLC throughout)
         for upsample_layers in self.upsample:
@@ -886,7 +914,7 @@ class Qwen3TTSSpeechTokenizerDecoder(nn.Module):
         # Convert back to NCL for output
         wav = mx.transpose(wav, (0, 2, 1))  # [batch, 1, samples]
 
-        return mx.clip(wav, -1.0, 1.0)
+        return mx.clip(self._to_output_dtype(wav), -1.0, 1.0)
 
     def reset_streaming_state(self):
         """Reset all conv buffers, overflow state, and transformer KV cache."""
@@ -912,7 +940,7 @@ class Qwen3TTSSpeechTokenizerDecoder(nn.Module):
             self._transformer_cache = self.pre_transformer.make_cache()
 
         # Dequantize: [batch, codebook_dim, time] (NCL)
-        hidden = self.quantizer.decode(codes)
+        hidden = self._to_compute_dtype(self.quantizer.decode(codes))
         # Convert to NLC
         hidden = mx.transpose(hidden, (0, 2, 1))
 
@@ -920,7 +948,9 @@ class Qwen3TTSSpeechTokenizerDecoder(nn.Module):
         hidden = self.pre_conv.step(hidden)
 
         # Transformer with KV cache
-        hidden = self.pre_transformer(hidden, cache=self._transformer_cache)
+        hidden = self._to_compute_dtype(
+            self.pre_transformer(hidden, cache=self._transformer_cache)
+        )
 
         # Upsampling: transpose conv (stateless) + ConvNeXtBlock (buffered)
         for upsample_layers in self.upsample:
@@ -936,7 +966,7 @@ class Qwen3TTSSpeechTokenizerDecoder(nn.Module):
 
         # Convert back to NCL for output
         wav = mx.transpose(wav, (0, 2, 1))
-        return mx.clip(wav, -1.0, 1.0)
+        return mx.clip(self._to_output_dtype(wav), -1.0, 1.0)
 
     def chunked_decode(
         self,

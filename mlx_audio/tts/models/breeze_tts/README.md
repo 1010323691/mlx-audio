@@ -110,6 +110,19 @@ for chunk in model.generate(
     print(chunk.audio.shape)
 ```
 
+## Codec precision
+
+The waveform decoder of the bundled codec runs in half precision by default.
+On an Apple M-series GPU it decodes about 1.4x faster and needs half the
+memory; the result stays 42-46 dB below the float32 waveform on speech. The
+codec encoder (reference clips) and the language model are not affected.
+Set the environment variable before loading the model to keep the
+checkpoint's float32 precision:
+
+```bash
+MLX_AUDIO_BREEZE_CODEC_DTYPE=float32 mlx_audio.server
+```
+
 The model weights, derivatives, and generated outputs are governed by the
 upstream BreezeBlue Research and Non-Commercial License. Review the [original
 model card](https://huggingface.co/BreezeBlue/Breeze-TTS-2) before use.
