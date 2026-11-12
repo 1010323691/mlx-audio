@@ -243,6 +243,33 @@ def test_rows_stop_independently_and_cfg_rows_compact(cpu):
     assert max(counts) == 30
 
 
+def test_compaction_waits_until_it_pays_off():
+    compact = Model._should_compact
+    assert not compact(96, 95)  # one dead row: not worth a cache copy
+    assert not compact(96, 73)  # 23 dead (< 1/4), still 65-128 rows
+    assert compact(96, 72)  # a quarter dead
+    assert compact(96, 64)  # drops into the 9-64 band
+    assert compact(200, 128) and not compact(200, 151)
+    assert not compact(8, 7) and compact(8, 6)
+
+
+def test_finished_rows_are_kept_until_compaction(cpu, monkeypatch):
+    """Rows that finish early stay in the batch (outputs ignored) until the
+    policy says to compact, and the results are the same either way."""
+    model = _model(0)
+    ref = mx.ones((20,))
+    kwargs = dict(cfg_scale=3.0, temperature=0, max_tokens=30)
+    outputs = {}
+    for name, policy in (("always", True), ("never", False)):
+        monkeypatch.setattr(
+            Model, "_should_compact", staticmethod(lambda rows, live: policy)
+        )
+        results, codes = _batch(model, ROWS, ref, **kwargs)
+        outputs[name] = ([r.token_count for r in results], codes)
+    assert outputs["never"] == outputs["always"]
+    assert len(set(outputs["never"][0])) > 2
+
+
 @pytest.mark.parametrize("sync_steps", [1, 3, 64])
 def test_host_sync_window_does_not_change_results(cpu, sync_steps):
     model = _model(0)

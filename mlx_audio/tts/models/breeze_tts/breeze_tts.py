@@ -1507,6 +1507,22 @@ class Model(nn.Module):
         uncond = logits[uncond_index]
         return uncond + scale.astype(cond.dtype) * (cond - uncond)
 
+    @staticmethod
+    def _should_compact(rows: int, live: int) -> bool:
+        """Whether to remove the finished rows from a ``rows``-row batch now.
+
+        ``BatchKVCache.filter`` copies every layer's cache and costs about
+        one decode step at ~96 rows, while a decode step costs about the
+        same for any row count within 1-8, 9-64, 65-128 and 129+ rows.
+        So compact when the live rows drop into a cheaper band, or when a
+        quarter of the batch is dead weight.
+        """
+
+        def band(n: int) -> int:
+            return 0 if n <= 8 else 1 if n <= 64 else 2 if n <= 128 else 3
+
+        return band(live) < band(rows) or rows - live >= rows / 4
+
     def _depth_tokens_batch(
         self,
         first_codebook: mx.array,
@@ -1788,8 +1804,9 @@ class Model(nn.Module):
         (results can still differ in the last bits because batched kernels
         reduce in a different order, which greedy decoding can amplify).
         Each row stops at its own EOS or after ``max_tokens`` frames
-        (an int, or one cap per row); finished rows are removed from the
-        batch.  Sampled frames are read back to the host every
+        (an int, or one cap per row).  Finished rows stop producing frames
+        and are removed from the batch only when that pays off (see
+        ``_should_compact``).  Sampled frames are read back to the host every
         ``sync_steps`` steps so graph construction overlaps GPU work; rows
         that finished inside a window are trimmed, so the window only costs
         a few wasted steps, never different output.  Results are yielded in
@@ -1867,6 +1884,7 @@ class Model(nn.Module):
             )
 
         uncond_index, expand_index, scale = cfg_indices()
+        done = [False] * count  # per batch position of ``active``
         sync_steps = max(1, int(sync_steps))
         pending_frames: list[mx.array] = []
         pending_eos: list[mx.array] = []
@@ -1924,25 +1942,28 @@ class Model(nn.Module):
             block_eos = mx.stack(pending_eos, axis=1).tolist()
             pending_frames, pending_eos = [], []
 
-            keep: list[int] = []
             for i, row in enumerate(active):
-                finished = False
+                if done[i]:
+                    continue
                 for frame_row, eos in zip(block_frames[i], block_eos[i]):
                     if eos:
-                        finished = True
+                        done[i] = True
                         break
                     frames[row].append(frame_row)
                     if len(frames[row]) >= token_caps[row]:
-                        finished = True
+                        done[i] = True
                         break
-                if not finished:
-                    keep.append(i)
-            if len(keep) == rows:
-                continue
+            keep = [i for i in range(rows) if not done[i]]
             if not keep:
                 break
-            # Drop finished rows (and their unconditional twins) from the
-            # batch so they no longer cost backbone or depth compute.
+            if len(keep) == rows:
+                continue
+            step_limit = max(token_caps[active[i]] for i in keep)
+            # Finished rows keep decoding (ignored) until removing them pays
+            # for the cache copy; then drop them and their unconditional
+            # twins so they no longer cost backbone or depth compute.
+            if not self._should_compact(rows, len(keep)):
+                continue
             kept_rows = {active[i] for i in keep}
             keep_uncond = [
                 rows + j for j, row in enumerate(active_uncond) if row in kept_rows
@@ -1955,8 +1976,8 @@ class Model(nn.Module):
                 seen = seen[mx.array(keep, dtype=mx.int32)]
             active = [active[i] for i in keep]
             active_uncond = [row for row in active_uncond if row in kept_rows]
+            done = [False] * len(active)
             uncond_index, expand_index, scale = cfg_indices()
-            step_limit = max(token_caps[row] for row in active)
             if verbose:
                 print(f"[breeze batch] step {steps}: {len(active)}/{count} rows active")
 
