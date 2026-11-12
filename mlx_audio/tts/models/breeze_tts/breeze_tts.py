@@ -29,6 +29,11 @@ from mlx_audio.utils import load_audio
 from .config import ModelConfig
 
 CODEC_DTYPE_ENV = "MLX_AUDIO_BREEZE_CODEC_DTYPE"
+# Growth step (positions) of the batched backbone KV cache.  BatchKVCache's
+# default of 256 rounds every row up to 256 positions and copies the whole
+# cache when it grows; a short-sentence batch (prompt ~250 + ~40 frames) then
+# held 512 positions per row.  64 keeps the waste small and changes no output.
+BACKBONE_CACHE_STEP = 64
 _CODEC_DTYPES = {"float16": mx.float16, "float32": mx.float32}
 
 
@@ -198,7 +203,10 @@ class _Backbone(nn.Module):
 
     def make_batch_cache(self, left_padding: list[int]) -> list[BatchKVCache]:
         """Per-row offset caches for left-padded batch prompts."""
-        return [BatchKVCache(left_padding) for _ in self.layers]
+        caches = [BatchKVCache(left_padding) for _ in self.layers]
+        for cache in caches:
+            cache.step = BACKBONE_CACHE_STEP
+        return caches
 
 
 class _TextEmbedding(nn.Module):
@@ -1762,7 +1770,8 @@ class Model(nn.Module):
             source_row * width + source_start + position - start,
             0,
         ).reshape(-1)
-        capacity = -(-(shared + block) // BatchKVCache.step) * BatchKVCache.step
+        step = BACKBONE_CACHE_STEP
+        capacity = -(-(shared + block) // step) * step
 
         def gather(states: mx.array) -> mx.array:
             # [prefixes, heads, width, dim] -> [rows, heads, capacity, dim]
@@ -1776,6 +1785,7 @@ class Model(nn.Module):
         for layer_cache in prefix_cache:
             keys, values, _, _ = layer_cache.state
             row_cache = BatchKVCache(left_padding)
+            row_cache.step = step
             row_cache.keys = gather(keys)
             row_cache.values = gather(values)
             row_cache.offset = mx.array([k - p for k, p in zip(kept, block_pad)])

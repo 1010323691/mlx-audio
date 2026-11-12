@@ -243,6 +243,25 @@ def test_rows_stop_independently_and_cfg_rows_compact(cpu):
     assert max(counts) == 30
 
 
+def test_batch_caches_grow_in_small_steps(cpu):
+    from mlx_audio.tts.models.breeze_tts.breeze_tts import BACKBONE_CACHE_STEP
+
+    model = _model(0)
+    ref = mx.ones((400,)) * 0.3
+    hidden, cache, _ = model._batch_prefill(
+        ["x", "a longer target text"],
+        [None, None],
+        [None, None],
+        [ref, ref],
+        ["a long reference transcript here", "a long reference transcript here"],
+        [False, False],
+    )
+    assert BACKBONE_CACHE_STEP == 64
+    assert all(c.step == BACKBONE_CACHE_STEP for c in cache)
+    assert cache[0].keys.shape[2] % BACKBONE_CACHE_STEP == 0
+    assert cache[0].keys.shape[2] - cache[0]._idx < BACKBONE_CACHE_STEP
+
+
 def test_compaction_waits_until_it_pays_off():
     compact = Model._should_compact
     assert not compact(96, 95)  # one dead row: not worth a cache copy
