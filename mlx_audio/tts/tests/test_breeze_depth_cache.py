@@ -247,3 +247,29 @@ def test_frames_do_not_share_cache_state():
     frame(other_hidden)  # interleave an unrelated frame
     assert frame(first_hidden) == expected
     assert frame(other_hidden) == frame(other_hidden)
+
+
+def test_concatenating_frame_cache_matches_the_slotted_kv_cache():
+    """The depth frame cache holds exactly the frame's positions, contiguous,
+    and gives the same logits as mlx-lm's 256-slot KVCache."""
+    from mlx_audio.lm.models.cache import KVCache
+
+    model = _randomized_model(3)
+    decoder = model.depth_decoder
+    mx.random.seed(5)
+    hidden = mx.random.normal((4, 16))
+    tokens = mx.array([1, 2, 3, 4])
+
+    def walk(cache):
+        decoder.start_frame(hidden, cache)
+        return [
+            decoder.step_logits(cache, head_idx=head, token_id=tokens)
+            for head in range(model.num_codebooks - 1)
+        ]
+
+    frame_cache = decoder.model.make_cache()
+    ours = walk(frame_cache)
+    slotted = walk([KVCache() for _ in decoder.model.layers])
+    for a, b in zip(ours, slotted):
+        assert mx.allclose(a, b, atol=1e-5).item()
+    assert all(c.keys.shape[2] == model.num_codebooks for c in frame_cache)
