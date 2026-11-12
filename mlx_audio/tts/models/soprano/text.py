@@ -185,9 +185,14 @@ def expand_abbreviations(text: str) -> str:
 _num_prefix_re = re.compile(r"#\d")
 _num_suffix_re = re.compile(r"\b\d+(K|M|B|T)\b", re.IGNORECASE)
 _comma_number_re = re.compile(r"(\d[\d,]+\d)")
+# A ten-digit phone number, as in "(415) 555-0123" or "555.123.4567", not part of
+# a longer number.
+_phone_number_re = re.compile(r"(?<!\d)(\(?\d{3}\)?[-.\s]\d{3}[-.\s]?\d{4})(?!\d)")
+_time_re = re.compile(r"(\d\d?:\d\d(?::\d\d(?:\.\d+)?)?)")
 _dollars_re = re.compile(r"\$([\d.,]*\d+)")
 _ordinal_re = re.compile(r"\d+(st|nd|rd|th)")
 _decimal_number_re = re.compile(r"\d+\.\d+")
+_num_letter_split_re = re.compile(r"(\d[a-z]|[a-z]\d)", re.IGNORECASE)
 _number_re = re.compile(r"\d+")
 
 
@@ -202,8 +207,47 @@ def _expand_num_suffix(m):
     return f"{match[:-1]} {suffixes.get(suffix, '')}"
 
 
+def _split_alphanumeric(m):
+    match = m.group(1)
+    return f"{match[0]} {match[1]}"
+
+
 def _remove_commas(m):
     return m.group(1).replace(",", "")
+
+
+def _expand_phone_number(m):
+    digits = re.sub(r"\D", "", m.group(1))
+    groups = (digits[:3], digits[3:6], digits[6:])
+    return ", ".join(" ".join(group) for group in groups)
+
+
+def _expand_time(m):
+    # Readings follow Soprano's reference normalizer ("3:30" -> "3 30", "9:05" ->
+    # "9 oh 5", "3:00" -> "3 o'clock"); the digits are spoken later.
+    hours, minutes, *seconds = m.group(1).split(":")
+    if not seconds:
+        if minutes == "00":
+            if int(hours) == 0:
+                return "0"
+            if int(hours) > 12:
+                return f"{hours} hundred"
+            return f"{hours} o'clock"
+        if minutes.startswith("0"):
+            minutes = f"oh {minutes[1:]}"
+        return f"{hours} {minutes}"
+    seconds = seconds[0]
+    if minutes == "00":
+        minutes = "oh oh"
+    elif minutes.startswith("0"):
+        minutes = f"oh {minutes[1:]}"
+    whole_seconds, decimal_point, fraction = seconds.partition(".")
+    if whole_seconds == "00":
+        # Keep the zero before a fraction for the decimal expansion step.
+        seconds = f"0.{fraction}" if decimal_point else ""
+    elif seconds.startswith("0"):
+        seconds = f"oh {seconds[1:]}"
+    return f"{hours} {minutes} {seconds}".strip()
 
 
 def _expand_dollars(m):
@@ -258,9 +302,13 @@ def normalize_numbers(text: str) -> str:
     text = re.sub(_num_prefix_re, _expand_num_prefix, text)
     text = re.sub(_num_suffix_re, _expand_num_suffix, text)
     text = re.sub(_comma_number_re, _remove_commas, text)
+    text = re.sub(_phone_number_re, _expand_phone_number, text)
+    text = re.sub(_time_re, _expand_time, text)
     text = re.sub(_dollars_re, _expand_dollars, text)
     text = re.sub(_decimal_number_re, _expand_decimal_point, text)
     text = re.sub(_ordinal_re, _expand_ordinal, text)
+    for _ in range(2):  # a second pass splits overlapping matches, like "a1b"
+        text = re.sub(_num_letter_split_re, _split_alphanumeric, text)
     text = re.sub(_number_re, _expand_number, text)
     return text
 

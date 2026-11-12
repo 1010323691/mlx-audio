@@ -80,6 +80,7 @@ nav:
     - Music Generation:
       - models/music/index.md
       - MiniMax Music 3: models/music/minimax-music3.md
+      - Stable Audio 3: models/music/stable-audio-3.md
     - Text-to-Speech:
       - models/tts/index.md
       - Ming-3.0 TTS Tiny: models/tts/ming3-tiny.md
@@ -103,6 +104,7 @@ nav:
       - Ming-3.0 ASR Tiny: models/stt/ming3-tiny.md
       - Whisper: models/stt/whisper.md
       - Parakeet: models/stt/parakeet.md
+      - Nemotron ASR Streaming: models/stt/nemotron-asr.md
       - Phonon-1: models/stt/phonon.md
       - Phonon-2 / 2.5: models/stt/phonon2.md
       - Voxtral Realtime: models/stt/voxtral-realtime.md

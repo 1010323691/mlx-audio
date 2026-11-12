@@ -1123,16 +1123,12 @@ class Qwen3ASRModel(nn.Module):
         gen_tokens = [0] * len(chunks)
         prompt_tokens = [0] * len(chunks)
         processed = [False] * len(chunks)
-        remaining_tokens = max_tokens
 
-        if remaining_tokens <= 0:
+        if max_tokens <= 0:
             return texts, gen_tokens, prompt_tokens, processed
 
         pbar = tqdm(total=len(chunks), desc="Processing chunks", disable=not verbose)
         for b0 in range(0, len(chunks), batch_size):
-            if remaining_tokens <= 0:
-                break
-
             group = chunks[b0 : b0 + batch_size]
             pad_to = max(len(c[0]) for c in group)
 
@@ -1178,14 +1174,15 @@ class Qwen3ASRModel(nn.Module):
                     processed.append(sample_logits)
                 return mx.concatenate(processed, axis=0)
 
-            y = sampler(apply_logits_processors(logits[:, -1, :]))
+            # Float32 normalization preserves close logits and the nucleus mass.
+            logits = apply_logits_processors(logits[:, -1, :]).astype(mx.float32)
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            y = sampler(logprobs)
             mx.async_eval(y)
 
             out_ids = [[] for _ in range(bsz)]
             done = [False] * bsz
-            group_tokens = 0
-            budget_exhausted = False
-            for _ in range(remaining_tokens):
+            for _ in range(max_tokens):
                 if token_histories is not None:
                     for i in range(bsz):
                         if not done[i]:
@@ -1199,13 +1196,17 @@ class Qwen3ASRModel(nn.Module):
                 next_logits = self._forward_with_embeds(
                     self.model.embed_tokens(y[:, None]), cache
                 )
-                next_y = sampler(apply_logits_processors(next_logits[:, -1, :]))
+                next_logits = apply_logits_processors(next_logits[:, -1, :]).astype(
+                    mx.float32
+                )
+                next_logprobs = next_logits - mx.logsumexp(
+                    next_logits, axis=-1, keepdims=True
+                )
+                next_y = sampler(next_logprobs)
                 mx.async_eval(next_y)
 
                 current_tokens = y.tolist()
                 for i, t in enumerate(current_tokens):
-                    if budget_exhausted:
-                        break
                     if done[i]:
                         continue
                     processed[b0 + i] = True
@@ -1213,11 +1214,7 @@ class Qwen3ASRModel(nn.Module):
                         done[i] = True
                     else:
                         out_ids[i].append(t)
-                        group_tokens += 1
-                        if group_tokens >= remaining_tokens:
-                            budget_exhausted = True
-                            break
-                if all(done) or budget_exhausted:
+                if all(done):
                     break
                 y = next_y
 
@@ -1226,7 +1223,6 @@ class Qwen3ASRModel(nn.Module):
                     out_ids[i], skip_special_tokens=True
                 )
                 gen_tokens[b0 + i] = len(out_ids[i])
-            remaining_tokens -= group_tokens
             pbar.update(bsz)
         pbar.close()
         return texts, gen_tokens, prompt_tokens, processed
@@ -1261,6 +1257,7 @@ class Qwen3ASRModel(nn.Module):
         list is not supported.
 
         Args:
+            max_tokens: Maximum tokens generated per chunk (default: 8192).
             chunk_duration: Maximum chunk duration in seconds (default: 1200 = 20 min).
             min_chunk_duration: Minimum chunk duration in seconds (default: 1.0).
             stream: If True, return a generator that yields tokens as they are generated.
@@ -1438,7 +1435,6 @@ class Qwen3ASRModel(nn.Module):
         segments = []
         total_prompt_tokens = 0
         total_generation_tokens = 0
-        remaining_tokens = max_tokens
 
         if max_tokens > 0 and batch_size > 1 and len(chunks) > 1:
             texts, gen_toks, prompt_toks, processed = self._generate_chunks_batched(
@@ -1484,13 +1480,9 @@ class Qwen3ASRModel(nn.Module):
             disable=not verbose or len(chunks) == 1,
         )
         for (chunk_audio, offset_sec), chunk_end in chunk_iter:
-            # Stop if we've exhausted the token budget
-            if remaining_tokens <= 0:
-                break
-
             text, prompt_toks, gen_toks = self._generate_single_chunk(
                 chunk_audio,
-                max_tokens=remaining_tokens,
+                max_tokens=max_tokens,
                 sampler=sampler,
                 logits_processors=logits_processors,
                 language=language,
@@ -1509,7 +1501,6 @@ class Qwen3ASRModel(nn.Module):
             all_texts.append(text)
             total_prompt_tokens += prompt_toks
             total_generation_tokens += gen_toks
-            remaining_tokens -= gen_toks
 
             # Create segment for this chunk
             segments.append(
@@ -1623,7 +1614,6 @@ class Qwen3ASRModel(nn.Module):
         # Track token counts across chunks
         total_prompt_tokens = 0
         total_generation_tokens = 0
-        remaining_tokens = max_tokens
 
         # Process each chunk and stream tokens
         chunk_iter = tqdm(
@@ -1648,7 +1638,7 @@ class Qwen3ASRModel(nn.Module):
             for i, (token, _) in enumerate(
                 self.stream_generate(
                     chunk_audio,
-                    max_tokens=remaining_tokens,
+                    max_tokens=max_tokens,
                     sampler=sampler,
                     logits_processors=logits_processors,
                     language=language,
@@ -1692,12 +1682,11 @@ class Qwen3ASRModel(nn.Module):
 
             # Update token counts
             total_generation_tokens += token_count
-            remaining_tokens -= token_count
 
             # Yield final result for this chunk
             yield StreamingResult(
                 text="",
-                is_final=is_last_chunk or remaining_tokens <= 0,
+                is_final=is_last_chunk,
                 start_time=offset_sec,
                 end_time=chunk_end_times[chunk_idx],
                 language=chunk_language,
@@ -1707,10 +1696,6 @@ class Qwen3ASRModel(nn.Module):
 
             # Clear cache between chunks
             mx.clear_cache()
-
-            # Stop if we've exhausted the token budget
-            if remaining_tokens <= 0:
-                break
 
 
 class Model:
