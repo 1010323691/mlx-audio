@@ -12,6 +12,7 @@ import inspect
 import io
 import json
 import os
+import queue
 import subprocess
 import time
 import uuid
@@ -942,11 +943,23 @@ _RESULT_WAIT_EXECUTOR = ThreadPoolExecutor(
     max_workers=int(os.getenv("MLX_AUDIO_RESULT_WAIT_THREADS", "1024")),
     thread_name_prefix="mlx-audio-result-wait",
 )
+# The broker drops a cancelled request without a final chunk, so a wait checks
+# for cancellation this often instead of blocking its thread forever.
+_RESULT_WAIT_POLL_S = 0.5
+
+
+def _wait_for_chunk(handle: InferenceHandle) -> InferenceResultChunk:
+    while True:
+        try:
+            return handle.result_queue.get(timeout=_RESULT_WAIT_POLL_S)
+        except queue.Empty:
+            if handle.cancel_event.is_set():
+                return InferenceResultChunk(kind="done")
 
 
 async def _next_inference_chunk(handle: InferenceHandle) -> InferenceResultChunk:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_RESULT_WAIT_EXECUTOR, handle.result_queue.get)
+    return await loop.run_in_executor(_RESULT_WAIT_EXECUTOR, _wait_for_chunk, handle)
 
 
 async def _stream_inference_results(

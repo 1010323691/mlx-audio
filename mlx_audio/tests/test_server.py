@@ -1545,3 +1545,23 @@ def test_a_whole_batch_sent_at_once_runs_as_one_batch():
     finally:
         loop.close()
         broker.stop_and_join()
+
+
+def test_a_cancelled_request_releases_its_wait_thread(monkeypatch):
+    """The broker drops a cancelled request without a final chunk; the thread
+    waiting for its result must still return instead of blocking forever."""
+    import threading
+    import time as _time
+
+    import mlx_audio.server as srv
+    from mlx_audio.server_inference import InferenceHandle
+
+    monkeypatch.setattr(srv, "_RESULT_WAIT_POLL_S", 0.05)
+    handle = InferenceHandle(
+        context=None, result_queue=queue.Queue(), cancel_event=threading.Event()
+    )
+    threading.Timer(0.1, handle.cancel).start()
+    started = _time.monotonic()
+    chunk = srv._wait_for_chunk(handle)
+    assert chunk.kind == "done"
+    assert _time.monotonic() - started < 2.0
