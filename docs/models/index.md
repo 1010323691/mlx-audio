@@ -15,6 +15,7 @@ Generate complete songs from a musical caption and structured lyrics.
 | Model | Description | Repo |
 |-------|-------------|------|
 | **MiniMax Music 3** | Multilingual song generation with structural tags and 44.1 kHz stereo output | [BF16](https://huggingface.co/mlx-community/MiniMax-Music3-bf16), [8-bit](https://huggingface.co/mlx-community/MiniMax-Music3-8bit), [6-bit](https://huggingface.co/mlx-community/MiniMax-Music3-6bit), [4-bit](https://huggingface.co/mlx-community/MiniMax-Music3-4bit), [MXFP8](https://huggingface.co/mlx-community/MiniMax-Music3-mxfp8), [MXFP4](https://huggingface.co/mlx-community/MiniMax-Music3-mxfp4), [NVFP4](https://huggingface.co/mlx-community/MiniMax-Music3-nvfp4) |
+| **Stable Audio 3** | Text to sound effects or music with 44.1 kHz stereo output | [small-sfx](https://huggingface.co/mlx-community/stable-audio-3-small-sfx), [small-music](https://huggingface.co/mlx-community/stable-audio-3-small-music) |
 
 [:octicons-arrow-right-24: Browse Music Models](music/index.md)
 
@@ -29,6 +30,7 @@ Generate natural-sounding speech from text. Multiple models with multilingual su
 | **Kokoro** | Fast, high-quality multilingual TTS | EN, JA, ZH, FR, ES, IT, PT, HI | [mlx-community/Kokoro-82M-bf16](https://huggingface.co/mlx-community/Kokoro-82M-bf16) |
 | **KittenTTS** | Compact KittenTTS 0.8 models for edge-friendly TTS | EN | [nano](https://huggingface.co/mlx-community/kitten-tts-nano-0.8) / [micro](https://huggingface.co/mlx-community/kitten-tts-micro-0.8) / [mini](https://huggingface.co/mlx-community/kitten-tts-mini-0.8) |
 | **Qwen3-TTS** | Alibaba's multilingual TTS with voice design | ZH, EN, JA, KO, + more | [mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16) |
+| **ZONOS3-Mini** | Multilingual TTS with 27 voices, voice cloning, and streaming at 44.1 kHz | Multilingual | [mlx-community/ZONOS3-Mini](https://huggingface.co/mlx-community/ZONOS3-Mini) |
 | **Voxtral TTS** | Mistral's 4B multilingual TTS (20 voices, 9 languages) | EN, FR, ES, DE, IT, PT, NL, AR, HI | [mlx-community/Voxtral-4B-TTS-2603-mlx-bf16](https://huggingface.co/mlx-community/Voxtral-4B-TTS-2603-mlx-bf16) |
 | **rumik-oss 1** | 3B expressive multilingual Indic TTS with 22-language support, description-conditioned delivery and inline vocalizations | 22 Indic languages + EN | [rumik-ai/rumik-oss-1](https://huggingface.co/rumik-ai/rumik-oss-1), [8bit](https://huggingface.co/rumik-ai/rumik-oss-1-mlx-8bit), [4bit](https://huggingface.co/rumik-ai/rumik-oss-1-mlx-4bit) |
 | **VoxCPM2** | 2B tokenizer-free TTS with 48kHz output, voice design, voice cloning, and continuation | 30 languages | [bf16](https://huggingface.co/mlx-community/VoxCPM2-bf16), [8bit](https://huggingface.co/mlx-community/VoxCPM2-8bit), [4bit](https://huggingface.co/mlx-community/VoxCPM2-4bit) |

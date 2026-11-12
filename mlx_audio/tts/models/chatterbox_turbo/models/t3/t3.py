@@ -335,7 +335,9 @@ class T3(nn.Module):
             )
 
         # Apply temperature
-        if temperature > 0 and temperature != 1.0:
+        if temperature <= 0:
+            return mx.argmax(logits, axis=-1)[:, None]
+        if temperature != 1.0:
             logits = logits / temperature
 
         # Apply top-k
@@ -399,7 +401,7 @@ class T3(nn.Module):
         # Find the k-th largest value as threshold
         # argpartition puts the k largest at the end
         partitioned = mx.argpartition(logits, -top_k, axis=-1)
-        kth_indices = partitioned[:, -top_k : -top_k + 1]  # The k-th largest index
+        kth_indices = partitioned[:, -top_k, None]  # The k-th largest index
         kth_values = mx.take_along_axis(logits, kth_indices, axis=-1)
 
         # Mask: keep values >= kth value

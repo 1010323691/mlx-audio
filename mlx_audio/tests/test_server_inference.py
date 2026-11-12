@@ -298,7 +298,9 @@ def test_inference_broker_runs_preflight_jobs_while_gathering():
 
     def client(i):
         _collect(broker.submit(endpoint_kind="preflight", model_name="m", payload=None))
-        handles[i] = broker.submit(endpoint_kind="batch", model_name="m", payload=("a", i))
+        handles[i] = broker.submit(
+            endpoint_kind="batch", model_name="m", payload=("a", i)
+        )
 
     try:
         threads = []
@@ -312,5 +314,30 @@ def test_inference_broker_runs_preflight_jobs_while_gathering():
         for handle in handles:
             _collect(handle)
         assert adapter.batches == [[("a", i) for i in range(5)]]
+    finally:
+        broker.stop_and_join()
+
+
+def test_inference_broker_clears_cache_when_continuous_session_drains(monkeypatch):
+    broker = InferenceBroker(idle_poll_s=0.01)
+    adapter = ContinuousAdapter()
+    broker.register_adapter("continuous", adapter)
+    cleared = threading.Event()
+
+    def clear_cache():
+        if adapter.sessions and adapter.sessions[-1].idle:
+            cleared.set()
+
+    monkeypatch.setattr(mx, "clear_cache", clear_cache)
+
+    try:
+        handle = broker.submit(
+            endpoint_kind="continuous",
+            model_name="model-a",
+            payload="first",
+        )
+
+        assert _collect(handle)[0].payload == ("continuous", "first")
+        assert cleared.wait(timeout=2)
     finally:
         broker.stop_and_join()
