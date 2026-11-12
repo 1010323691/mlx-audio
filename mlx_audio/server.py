@@ -12,10 +12,12 @@ import inspect
 import io
 import json
 import os
+import queue
 import subprocess
 import time
 import uuid
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
@@ -931,8 +933,33 @@ def get_inference_broker() -> InferenceBroker:
     return INFERENCE_BROKER
 
 
+# Waiting for a broker result blocks a thread for as long as the request is in
+# flight.  On asyncio's default executor (min(32, cpus + 4) threads) a client
+# that sends a whole batch at once used up every thread with the first requests'
+# waits, so the rest could not even wait for their model preflight, the gather
+# window closed, and the batch ran as two (e.g. 23 + 177 rows).  The waits get
+# their own pool; threads are created on demand, so the cap costs nothing idle.
+_RESULT_WAIT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.getenv("MLX_AUDIO_RESULT_WAIT_THREADS", "1024")),
+    thread_name_prefix="mlx-audio-result-wait",
+)
+# The broker drops a cancelled request without a final chunk, so a wait checks
+# for cancellation this often instead of blocking its thread forever.
+_RESULT_WAIT_POLL_S = 0.5
+
+
+def _wait_for_chunk(handle: InferenceHandle) -> InferenceResultChunk:
+    while True:
+        try:
+            return handle.result_queue.get(timeout=_RESULT_WAIT_POLL_S)
+        except queue.Empty:
+            if handle.cancel_event.is_set():
+                return InferenceResultChunk(kind="done")
+
+
 async def _next_inference_chunk(handle: InferenceHandle) -> InferenceResultChunk:
-    return await asyncio.to_thread(handle.result_queue.get)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_RESULT_WAIT_EXECUTOR, _wait_for_chunk, handle)
 
 
 async def _stream_inference_results(

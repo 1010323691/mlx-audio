@@ -11,6 +11,7 @@ import math
 import os
 import re
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional, Union
 
@@ -29,6 +30,11 @@ from mlx_audio.utils import load_audio
 from .config import ModelConfig
 
 CODEC_DTYPE_ENV = "MLX_AUDIO_BREEZE_CODEC_DTYPE"
+# Growth step (positions) of the batched backbone KV cache.  BatchKVCache's
+# default of 256 rounds every row up to 256 positions and copies the whole
+# cache when it grows; a short-sentence batch (prompt ~250 + ~40 frames) then
+# held 512 positions per row.  64 keeps the waste small and changes no output.
+BACKBONE_CACHE_STEP = 64
 _CODEC_DTYPES = {"float16": mx.float16, "float32": mx.float32}
 
 
@@ -198,7 +204,10 @@ class _Backbone(nn.Module):
 
     def make_batch_cache(self, left_padding: list[int]) -> list[BatchKVCache]:
         """Per-row offset caches for left-padded batch prompts."""
-        return [BatchKVCache(left_padding) for _ in self.layers]
+        caches = [BatchKVCache(left_padding) for _ in self.layers]
+        for cache in caches:
+            cache.step = BACKBONE_CACHE_STEP
+        return caches
 
 
 class _TextEmbedding(nn.Module):
@@ -871,9 +880,46 @@ class Model(nn.Module):
             raise RuntimeError("Breeze tokenizer was not loaded")
         return mx.array(self.tokenizer(text, add_special_tokens=True)["input_ids"])
 
+    # Reference clips encoded by path, kept across calls (a few KiB each).
+    REFERENCE_CACHE_SIZE = 64
+
     def _encode_reference(self, ref_audio: Union[str, Path, mx.array]) -> mx.array:
+        """Codec codes ``[1, frames, codebooks]`` of a reference clip.
+
+        Clips given by path are cached across calls, keyed by the resolved
+        path, modification time, size and codec, so a replaced file (or a
+        swapped codec) is re-encoded.
+        """
         if self.audio_tokenizer is None:
             raise RuntimeError("Breeze audio tokenizer was not loaded")
+        key = None
+        if isinstance(ref_audio, (str, Path)):
+            try:
+                stat = os.stat(ref_audio)
+                key = (
+                    os.path.realpath(ref_audio),
+                    stat.st_mtime_ns,
+                    stat.st_size,
+                    id(self.audio_tokenizer),
+                )
+            except OSError:
+                key = None
+            # A plain attribute: nn.Module would treat a dict as parameters.
+            cache = self.__dict__.setdefault("_reference_codes", OrderedDict())
+            if key is not None and key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+            codes = self._encode_reference_audio(ref_audio)
+            if key is not None:
+                cache[key] = codes
+                while len(cache) > self.REFERENCE_CACHE_SIZE:
+                    cache.popitem(last=False)
+            return codes
+        return self._encode_reference_audio(ref_audio)
+
+    def _encode_reference_audio(
+        self, ref_audio: Union[str, Path, mx.array]
+    ) -> mx.array:
         if isinstance(ref_audio, (str, Path)):
             audio = load_audio(str(ref_audio), sample_rate=self.sample_rate)
         else:
@@ -1164,24 +1210,20 @@ class Model(nn.Module):
         return audio
 
     def _decode_codes(self, codes: mx.array) -> mx.array:
-        """Decode one sequence and honor the tokenizer's valid length."""
+        """Decode one unpadded sequence into its full waveform.
+
+        The codec also returns a "valid length", counted as the frames whose
+        first code is above 0, for batches right-padded with zeros.  Breeze
+        never pads: a row ends at the EOS class, and 0 is an ordinary code
+        that turns up inside speech (about 1 frame in 700), so that length
+        cut 80 ms off the end of the row for every such frame.
+        """
         decoded = self.audio_tokenizer.decode(codes)
-        lengths = None
         if isinstance(decoded, (list, tuple)):
             if not decoded:
                 return mx.zeros((0,), dtype=mx.float32)
-            audio_data = decoded[0]
-            if len(decoded) > 1:
-                lengths = decoded[1]
-        else:
-            audio_data = decoded
-        audio = self._audio_vector(audio_data)
-        if lengths is not None:
-            lengths = mx.array(lengths).reshape(-1)
-            if lengths.shape[0]:
-                valid_samples = max(0, int(lengths[0].item()))
-                audio = audio[:valid_samples]
-        return audio
+            decoded = decoded[0]
+        return self._audio_vector(decoded)
 
     def _empty_audio(self) -> mx.array:
         """Return the official silent fallback when EOS precedes all frames."""
@@ -1766,7 +1808,8 @@ class Model(nn.Module):
             source_row * width + source_start + position - start,
             0,
         ).reshape(-1)
-        capacity = -(-(shared + block) // BatchKVCache.step) * BatchKVCache.step
+        step = BACKBONE_CACHE_STEP
+        capacity = -(-(shared + block) // step) * step
 
         def gather(states: mx.array) -> mx.array:
             # [prefixes, heads, width, dim] -> [rows, heads, capacity, dim]
@@ -1780,6 +1823,7 @@ class Model(nn.Module):
         for layer_cache in prefix_cache:
             keys, values, _, _ = layer_cache.state
             row_cache = BatchKVCache(left_padding)
+            row_cache.step = step
             row_cache.keys = gather(keys)
             row_cache.values = gather(values)
             row_cache.offset = mx.array([k - p for k, p in zip(kept, block_pad)])

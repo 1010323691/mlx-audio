@@ -243,6 +243,25 @@ def test_rows_stop_independently_and_cfg_rows_compact(cpu):
     assert max(counts) == 30
 
 
+def test_batch_caches_grow_in_small_steps(cpu):
+    from mlx_audio.tts.models.breeze_tts.breeze_tts import BACKBONE_CACHE_STEP
+
+    model = _model(0)
+    ref = mx.ones((400,)) * 0.3
+    hidden, cache, _ = model._batch_prefill(
+        ["x", "a longer target text"],
+        [None, None],
+        [None, None],
+        [ref, ref],
+        ["a long reference transcript here", "a long reference transcript here"],
+        [False, False],
+    )
+    assert BACKBONE_CACHE_STEP == 64
+    assert all(c.step == BACKBONE_CACHE_STEP for c in cache)
+    assert cache[0].keys.shape[2] % BACKBONE_CACHE_STEP == 0
+    assert cache[0].keys.shape[2] - cache[0]._idx < BACKBONE_CACHE_STEP
+
+
 def test_compaction_waits_until_it_pays_off():
     compact = Model._should_compact
     assert not compact(96, 95)  # one dead row: not worth a cache copy
@@ -340,6 +359,25 @@ def test_shared_reference_is_encoded_once(cpu):
         )
     )
     assert model.audio_tokenizer.encode_calls == 1
+
+
+def test_reference_clip_files_are_encoded_once_across_calls(cpu, tmp_path):
+    import numpy as np
+    import soundfile as sf
+
+    model = _model(2)
+    clip = tmp_path / "voice.wav"
+    sf.write(clip, np.full(2400, 0.1, dtype=np.float32), model.sample_rate)
+    kwargs = dict(ref_audios=str(clip), ref_texts="ref", max_tokens=2)
+    list(model.batch_generate(["a", "bb"], **kwargs))
+    list(model.batch_generate(["ccc"], **kwargs))
+    list(model.generate("dd", ref_audio=str(clip), ref_text="ref", max_tokens=2))
+    assert model.audio_tokenizer.encode_calls == 1
+
+    # A replaced file is encoded again.
+    sf.write(clip, np.full(3200, 0.2, dtype=np.float32), model.sample_rate)
+    list(model.batch_generate(["a"], **kwargs))
+    assert model.audio_tokenizer.encode_calls == 2
 
 
 def test_sampled_batch_respects_max_tokens_and_seed(cpu):

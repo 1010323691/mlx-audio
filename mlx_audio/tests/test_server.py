@@ -1,7 +1,9 @@
+import asyncio
 import functools
 import inspect
 import io
 import json
+import os
 import queue
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1469,3 +1471,97 @@ def test_tts_speech_streaming_uses_generate_config(client, mock_model_provider):
         "top_k": 50,
         "repetition_penalty": 1.05,
     }
+
+
+def test_a_whole_batch_sent_at_once_runs_as_one_batch():
+    """Every in-flight request blocks a thread while waiting for its preflight
+    and then its result.  Requests arrive a few ms apart, like a client sending
+    a whole batch: the first ones are already waiting for their results when
+    the later ones need a thread to wait for their preflight.  With 3x more
+    requests than asyncio's default executor has threads, the gather window
+    must still see them all."""
+    import concurrent.futures
+    import time as _time
+
+    from mlx_audio.server import _next_inference_chunk
+    from mlx_audio.server_inference import BaseModelExecutionAdapter, InferenceBroker
+
+    class Preflight(BaseModelExecutionAdapter):
+        run_while_gathering = True
+
+        def run_serial(self, request):
+            request.emit_done()
+
+    class Batching(BaseModelExecutionAdapter):
+        max_batch_size = 1000
+        batch_gather_s = 0.25
+        batch_gather_max_s = 3.0
+
+        def __init__(self):
+            self.batches = []
+
+        def supports_batch(self, request):
+            return True
+
+        def batch_key(self, request):
+            return "same"
+
+        def run_serial(self, request):
+            self.run_batch([request])
+
+        def run_batch(self, requests):
+            self.batches.append(len(requests))
+            _time.sleep(0.05)
+            for request in requests:
+                request.emit_data(request.payload)
+                request.emit_done()
+
+    async def one_request(broker, i):
+        await asyncio.sleep(0.003 * i)
+        handle = broker.submit(endpoint_kind="preflight", model_name="m", payload=None)
+        while (await _next_inference_chunk(handle)).kind != "done":
+            pass
+        handle = broker.submit(endpoint_kind="tts", model_name="m", payload=i)
+        while (await _next_inference_chunk(handle)).kind != "done":
+            pass
+
+    async def send_all(broker, count):
+        await asyncio.gather(*(one_request(broker, i) for i in range(count)))
+
+    default_threads = min(32, (os.cpu_count() or 1) + 4)
+    broker = InferenceBroker(idle_poll_s=0.01)
+    adapter = Batching()
+    broker.register_adapter("tts", adapter)
+    broker.register_adapter("preflight", Preflight())
+    loop = asyncio.new_event_loop()
+    # Keep the event loop's default executor at its stock size.
+    loop.set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(max_workers=default_threads)
+    )
+    try:
+        count = 3 * default_threads
+        loop.run_until_complete(asyncio.wait_for(send_all(broker, count), 30))
+        assert adapter.batches == [count]
+    finally:
+        loop.close()
+        broker.stop_and_join()
+
+
+def test_a_cancelled_request_releases_its_wait_thread(monkeypatch):
+    """The broker drops a cancelled request without a final chunk; the thread
+    waiting for its result must still return instead of blocking forever."""
+    import threading
+    import time as _time
+
+    import mlx_audio.server as srv
+    from mlx_audio.server_inference import InferenceHandle
+
+    monkeypatch.setattr(srv, "_RESULT_WAIT_POLL_S", 0.05)
+    handle = InferenceHandle(
+        context=None, result_queue=queue.Queue(), cancel_event=threading.Event()
+    )
+    threading.Timer(0.1, handle.cancel).start()
+    started = _time.monotonic()
+    chunk = srv._wait_for_chunk(handle)
+    assert chunk.kind == "done"
+    assert _time.monotonic() - started < 2.0

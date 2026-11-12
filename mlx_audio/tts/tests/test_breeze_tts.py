@@ -618,3 +618,23 @@ def test_depth_weights_stored_transposed_keep_values_and_shapes():
 
     assert {k: v.shape for k, v in tree_flatten(depth.parameters())} == shapes
     np.testing.assert_allclose(np.array(after), np.array(before), atol=1e-4)
+
+
+def test_decoded_audio_keeps_frames_whose_first_code_is_zero():
+    # The codec reports a valid length of (frames with first code > 0) * hop,
+    # meant for zero-padded batches.  0 is an ordinary code in Breeze output,
+    # so honouring that length used to cut the end of the row.
+    model = Model(tiny_config())
+
+    class Codec:
+        def decode(self, codes):
+            frames = codes.shape[1]
+            audio = mx.arange(frames * 4, dtype=mx.float32)[None, :] + 1
+            lengths = (codes[..., 0] > 0).sum(axis=1) * 4
+            return audio, lengths
+
+    model.audio_tokenizer = Codec()
+    codes = mx.array([[[5, 1, 2], [0, 3, 4], [7, 1, 1], [0, 2, 2]]], dtype=mx.int32)
+    audio = model._decode_codes(codes)
+    assert audio.shape == (16,)
+    assert audio[-1].item() == 16
