@@ -544,6 +544,21 @@ class _DepthModel(nn.Module):
         """A fresh KV cache for one frame of depth decoding."""
         return [KVCache() for _ in self.layers]
 
+    def store_linear_weights_transposed(self) -> None:
+        """Keep each Linear weight as a transposed view of an [in, out] buffer.
+
+        ``nn.Linear`` computes ``x @ weight.T``.  With the checkpoint's
+        row-major ``[out, in]`` weights, MLX's matmul for more than 64 rows
+        streams the transposed operand once per 64-row tile; stored this
+        way, ``weight.T`` is row-major and the 16 depth passes per frame run
+        9-17% faster at 72-128 rows, unchanged at 64 rows or fewer.  The
+        values (and the parameter shapes) are the same; only the memory
+        layout changes, so it costs no extra memory.
+        """
+        for _, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                module.weight = mx.contiguous(module.weight.T).T
+
     def embed_codebook_token(
         self, token_id: Union[int, mx.array], codebook_idx: int
     ) -> mx.array:
@@ -766,6 +781,8 @@ class Model(nn.Module):
                 f"Breeze checkpoint has no audio_tokenizer at {codec_path}"
             )
         model.audio_tokenizer = cls._load_audio_tokenizer(codec_path)
+        model.depth_decoder.model.store_linear_weights_transposed()
+        mx.eval(model.depth_decoder.parameters())
         codec_dtype = cls._codec_decode_dtype()
         if codec_dtype != mx.float32:
             model.audio_tokenizer.decoder.set_compute_dtype(codec_dtype)
@@ -775,9 +792,10 @@ class Model(nn.Module):
     def _codec_decode_dtype() -> mx.Dtype:
         """Precision of the codec's waveform decoder (not its encoder).
 
-        Half precision is the default: it decodes about 1.4x faster with
-        half the memory, and stays 42-46 dB below the float32 waveform on
-        speech.  Set ``MLX_AUDIO_BREEZE_CODEC_DTYPE=float32`` to keep the
+        Half precision is the default: on an Apple M6 it decodes about 2.3x
+        faster than float32 with half the memory; against the float32
+        waveform the difference is typically 43-45 dB below the signal and
+        30-36 dB on the worst clips measured.  Set ``MLX_AUDIO_BREEZE_CODEC_DTYPE=float32`` to keep the
         checkpoint's precision.
         """
         raw = os.environ.get(CODEC_DTYPE_ENV, "").strip().lower() or "float16"
@@ -892,6 +910,28 @@ class Model(nn.Module):
         ``ref_audio`` (``[1, frames, codebooks]``) instead of re-running the
         codec encoder for every row that shares a reference clip.
         """
+        return self._embed_segments(
+            self._prompt_segments(
+                text,
+                voice=voice,
+                instruct=instruct,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                reference_codes=reference_codes,
+            )
+        )
+
+    def _prompt_segments(
+        self,
+        text: str,
+        *,
+        voice: Optional[str],
+        instruct: Optional[str],
+        ref_audio: Optional[Union[str, Path, mx.array]],
+        ref_text: Optional[str],
+        reference_codes: Optional[mx.array] = None,
+    ) -> list[tuple[str, Any]]:
+        """A prompt as ``("text", string)`` / ``("audio", codes)`` segments."""
         if isinstance(ref_audio, (list, tuple)):
             if len(ref_audio) != 1:
                 raise ValueError(
@@ -907,9 +947,9 @@ class Model(nn.Module):
         if ref_audio is not None and not ref_text:
             raise ValueError("Breeze voice cloning requires ref_text with ref_audio.")
         speaker = self._speaker(voice)
-        segments: list[tuple[str, mx.array]] = []
+        segments: list[tuple[str, Any]] = []
         if ref_audio is not None:
-            segments.append(("text", self._text_ids(f"{speaker}{ref_text}")))
+            segments.append(("text", f"{speaker}{ref_text}"))
             segments.append(
                 (
                     "audio",
@@ -923,12 +963,27 @@ class Model(nn.Module):
         target = f"{speaker}{text}"
         if instruct:
             target = f"{speaker}<ins_bos>{instruct}<ins_eos>{text}"
-        segments.append(("text", self._text_ids(target)))
+        segments.append(("text", target))
+        return segments
 
+    def _embed_segments(
+        self,
+        segments: list[tuple[str, Any]],
+        text_embeddings: Optional[dict[str, mx.array]] = None,
+    ) -> mx.array:
+        """Concatenate segment embeddings into ``[1, length, hidden]``.
+
+        ``text_embeddings`` maps each text segment to its already encoded
+        ``[1, tokens, hidden]`` embedding (see ``_encode_texts``); without
+        it every text segment is encoded on its own.
+        """
         embeddings: list[mx.array] = []
         for kind, values in segments:
             if kind == "text":
-                hidden = self.text_encoder(values[None, :])
+                if text_embeddings is not None:
+                    embeddings.append(text_embeddings[values])
+                    continue
+                hidden = self.text_encoder(self._text_ids(values)[None, :])
                 embeddings.append(self.text_encoder_proj(hidden))
             else:
                 embeddings.append(self.backbone_model.embed_tokens(values))
@@ -937,6 +992,34 @@ class Model(nn.Module):
                 )
                 embeddings.append(self.backbone_model.embed_tokens(eos_codes))
         return mx.concatenate(embeddings, axis=1)
+
+    def _encode_texts(self, strings: list[str], chunk: int = 64) -> dict[str, mx.array]:
+        """Encode each distinct string once, in right-padded batches.
+
+        Returns ``{string: [1, tokens, hidden]}``, the projected text-encoder
+        output that ``_embed_segments`` concatenates.  The encoder is
+        bidirectional, so padding is hidden with its attention mask; rows
+        are grouped by token count to keep the padding small.
+        """
+        ids = {text: self._text_ids(text) for text in dict.fromkeys(strings)}
+        order = sorted(ids, key=lambda text: int(ids[text].shape[0]))
+        encoded: dict[str, mx.array] = {}
+        for start in range(0, len(order), chunk):
+            part = order[start : start + chunk]
+            lengths = [int(ids[text].shape[0]) for text in part]
+            width = max(lengths)
+            tokens = mx.stack(
+                [mx.pad(ids[text], (0, width - n)) for text, n in zip(part, lengths)]
+            )
+            mask = (mx.arange(width)[None, :] < mx.array(lengths)[:, None]).astype(
+                mx.int32
+            )
+            hidden = self.text_encoder_proj(
+                self.text_encoder(tokens, attention_mask=mask)
+            )
+            for row, (text, n) in enumerate(zip(part, lengths)):
+                encoded[text] = hidden[row : row + 1, :n]
+        return encoded
 
     def _sample(
         self,
@@ -1406,15 +1489,19 @@ class Model(nn.Module):
         return [values] * count
 
     @staticmethod
-    def _prefill_mask(left_padding: list[int], length: int) -> mx.array:
+    def _prefill_mask(
+        left_padding: list[int], length: int, offset: int = 0
+    ) -> mx.array:
         """Causal mask that hides each row's left padding.
 
-        Padded query positions may still attend to themselves so that no
-        softmax row is fully masked (which would put NaNs into the padded
-        key/value slots of later layers); real positions never see padding.
+        The ``length`` queries sit after ``offset`` positions already in the
+        cache.  Padded query positions may still attend to themselves so
+        that no softmax row is fully masked (which would put NaNs into the
+        padded key/value slots of later layers); real positions never see
+        padding.
         """
-        query = mx.arange(length)[:, None]
-        key = mx.arange(length)[None, :]
+        query = mx.arange(offset, offset + length)[:, None]
+        key = mx.arange(offset + length)[None, :]
         pad = mx.array(left_padding, dtype=mx.int32)[:, None, None, None]
         visible = (query >= key) & (key >= pad)
         return visible | (query == key)
@@ -1437,6 +1524,22 @@ class Model(nn.Module):
         cond = logits[:rows]
         uncond = logits[uncond_index]
         return uncond + scale.astype(cond.dtype) * (cond - uncond)
+
+    @staticmethod
+    def _should_compact(rows: int, live: int) -> bool:
+        """Whether to remove the finished rows from a ``rows``-row batch now.
+
+        ``BatchKVCache.filter`` copies every layer's cache and costs about
+        one decode step at ~96 rows, while a decode step costs about the
+        same for any row count within 1-8, 9-64, 65-128 and 129+ rows.
+        So compact when the live rows drop into a cheaper band, or when a
+        quarter of the batch is dead weight.
+        """
+
+        def band(n: int) -> int:
+            return 0 if n <= 8 else 1 if n <= 64 else 2 if n <= 128 else 3
+
+        return band(live) < band(rows) or rows - live >= rows / 4
 
     def _depth_tokens_batch(
         self,
@@ -1490,6 +1593,14 @@ class Model(nn.Module):
         Cache rows are the conditional rows in input order followed by one
         unconditional row per CFG row (``uncond_owner`` gives its input row).
         Returns the last hidden state of every cache row and the cache.
+
+        A prompt is ``[reference prefix | target text]`` and every row of one
+        voice has the same prefix, so the backbone runs each distinct prefix
+        once and copies its keys/values into the rows.  Only the last
+        ``block`` positions of every prompt (``block`` = longest target; a
+        shorter target is topped up with the end of its prefix) go through
+        the batched prefill on top of that.  The backbone is causal, so the
+        copied keys/values are the ones the row would have computed itself.
         """
         # Encode each distinct reference clip once per call.
         encoded_refs: dict[Any, mx.array] = {}
@@ -1513,8 +1624,8 @@ class Model(nn.Module):
             return encoded_refs[key]
 
         # Cache rows are [conditional rows..., unconditional CFG rows...].
-        cond_prompts: list[mx.array] = []
-        uncond_prompts: list[mx.array] = []
+        cond_prompts: list[list[tuple[str, Any]]] = []
+        uncond_prompts: list[list[tuple[str, Any]]] = []
         uncond_owner: list[int] = []
         for row, text in enumerate(texts):
             text = text.strip() or text
@@ -1530,37 +1641,151 @@ class Model(nn.Module):
                 reference_codes=codes,
             )
             cond_prompts.append(
-                self._prompt_embeddings(text, instruct=instructs[row], **prompt_kwargs)
+                self._prompt_segments(text, instruct=instructs[row], **prompt_kwargs)
             )
             if use_cfg[row]:
                 uncond_prompts.append(
-                    self._prompt_embeddings(text, instruct=None, **prompt_kwargs)
+                    self._prompt_segments(text, instruct=None, **prompt_kwargs)
                 )
                 uncond_owner.append(row)
-        all_prompts = cond_prompts + uncond_prompts
-        lengths = [int(p.shape[1]) for p in all_prompts]
-        width = max(lengths)
-        left_padding = [width - length for length in lengths]
-        padded = [
-            (
-                mx.concatenate(
-                    [mx.zeros((1, pad, p.shape[-1]), dtype=p.dtype), p], axis=1
-                )
-                if pad
-                else p
+        # Encode every distinct text segment once, batched: rows that share
+        # a reference transcript reuse its encoding.
+        segments = cond_prompts + uncond_prompts
+        text_embeddings = self._encode_texts(
+            [value for prompt in segments for kind, value in prompt if kind == "text"]
+        )
+        # Split every prompt into its (shared) prefix and its target text.
+        prefix_index: dict[tuple, int] = {}
+        prefixes: list[mx.array] = []
+        row_prefix: list[int] = []  # index into ``prefixes``; -1 = no prefix
+        targets: list[mx.array] = []
+        for prompt in segments:
+            *head, (_, target) = prompt
+            targets.append(text_embeddings[target])
+            if not head:
+                row_prefix.append(-1)
+                continue
+            key = tuple(
+                value if kind == "text" else ("audio", id(value))
+                for kind, value in head
             )
-            for p, pad in zip(all_prompts, left_padding)
-        ]
-        embeddings = mx.concatenate(padded, axis=0)
-        del cond_prompts, uncond_prompts, all_prompts, padded
+            if key not in prefix_index:
+                prefix_index[key] = len(prefixes)
+                prefixes.append(self._embed_segments(head, text_embeddings))
+            row_prefix.append(prefix_index[key])
+        del text_embeddings, cond_prompts, uncond_prompts, segments
 
-        cache = self.backbone_model.make_batch_cache(left_padding)
+        prefix_len = [int(p.shape[1]) for p in prefixes]
+        totals = [
+            (prefix_len[u] if u >= 0 else 0) + int(t.shape[1])
+            for u, t in zip(row_prefix, targets)
+        ]
+        block = max(int(t.shape[1]) for t in targets)
+        # ``kept``: prefix positions copied from the shared prefix cache;
+        # ``block_pad``: left padding inside the block (prompt < block).
+        kept = [max(0, total - block) for total in totals]
+        block_pad = [max(0, block - total) for total in totals]
+        shared = max(kept)
+        left_padding = [shared - k + pad for k, pad in zip(kept, block_pad)]
+        cache = self._shared_prefix_cache(prefixes, row_prefix, kept, block_pad, block)
+
+        pieces = []
+        for u, k, pad, target in zip(row_prefix, kept, block_pad, targets):
+            parts = []
+            if pad:
+                parts.append(mx.zeros((1, pad, target.shape[-1]), dtype=target.dtype))
+            if u >= 0 and prefix_len[u] > k:
+                parts.append(prefixes[u][:, k:])
+            parts.append(target)
+            pieces.append(mx.concatenate(parts, axis=1))
+        embeddings = mx.concatenate(pieces, axis=0)
+        del pieces, prefixes, targets
+
         hidden = self.backbone_model(
             input_embeddings=embeddings,
             cache=cache,
-            mask=self._prefill_mask(left_padding, width),
+            mask=self._prefill_mask(left_padding, block, offset=shared),
         )[:, -1, :]
         return hidden, cache, uncond_owner
+
+    def _shared_prefix_cache(
+        self,
+        prefixes: list[mx.array],
+        row_prefix: list[int],
+        kept: list[int],
+        block_pad: list[int],
+        block: int,
+    ) -> list[BatchKVCache]:
+        """Backbone cache holding each row's first ``kept`` prefix positions.
+
+        Each distinct prefix runs through the backbone once (only as far as
+        its rows need), then its keys/values are gathered into the rows,
+        right-aligned at ``shared = max(kept)`` with the rest left-padded.
+        The buffers are sized for the following ``block`` positions, as a
+        prefill of the whole prompt would have allocated them.
+        """
+        rows = len(row_prefix)
+        shared = max(kept)
+        left_padding = [shared - k + pad for k, pad in zip(kept, block_pad)]
+        if shared == 0:
+            return self.backbone_model.make_batch_cache(left_padding)
+
+        need = [0] * len(prefixes)
+        for u, k in zip(row_prefix, kept):
+            if u >= 0:
+                need[u] = max(need[u], k)
+        used = [u for u in range(len(prefixes)) if need[u]]
+        slot = {u: j for j, u in enumerate(used)}
+        width = max(need)
+        pad = [width - need[u] for u in used]
+        prefix_cache = self.backbone_model.make_batch_cache(pad)
+        self.backbone_model(
+            input_embeddings=mx.concatenate(
+                [
+                    mx.pad(prefixes[u][:, : need[u]], [(0, 0), (p, 0), (0, 0)])
+                    for u, p in zip(used, pad)
+                ],
+                axis=0,
+            ),
+            cache=prefix_cache,
+            mask=self._prefill_mask(pad, width),
+        )
+
+        # Row r, slot t < shared holds prefix position t - (shared - kept[r])
+        # of its voice; earlier slots are padding (masked; any finite value).
+        position = mx.arange(shared)[None, :]
+        start = mx.array([shared - k for k in kept])[:, None]
+        source_row = mx.array(
+            [slot.get(u, 0) if k else 0 for u, k in zip(row_prefix, kept)]
+        )[:, None]
+        source_start = mx.array(
+            [width - need[u] if k else 0 for u, k in zip(row_prefix, kept)]
+        )[:, None]
+        flat = mx.where(
+            position >= start,
+            source_row * width + source_start + position - start,
+            0,
+        ).reshape(-1)
+        capacity = -(-(shared + block) // BatchKVCache.step) * BatchKVCache.step
+
+        def gather(states: mx.array) -> mx.array:
+            # [prefixes, heads, width, dim] -> [rows, heads, capacity, dim]
+            _, heads, _, dim = states.shape
+            states = states.transpose(0, 2, 1, 3).reshape(-1, heads, dim)
+            states = states[flat].reshape(rows, shared, heads, dim)
+            states = states.transpose(0, 2, 1, 3)
+            return mx.pad(states, [(0, 0), (0, 0), (0, capacity - shared), (0, 0)])
+
+        cache = []
+        for layer_cache in prefix_cache:
+            keys, values, _, _ = layer_cache.state
+            row_cache = BatchKVCache(left_padding)
+            row_cache.keys = gather(keys)
+            row_cache.values = gather(values)
+            row_cache.offset = mx.array([k - p for k, p in zip(kept, block_pad)])
+            row_cache._idx = shared
+            cache.append(row_cache)
+        return cache
 
     def batch_generate(
         self,
@@ -1597,8 +1822,9 @@ class Model(nn.Module):
         (results can still differ in the last bits because batched kernels
         reduce in a different order, which greedy decoding can amplify).
         Each row stops at its own EOS or after ``max_tokens`` frames
-        (an int, or one cap per row); finished rows are removed from the
-        batch.  Sampled frames are read back to the host every
+        (an int, or one cap per row).  Finished rows stop producing frames
+        and are removed from the batch only when that pays off (see
+        ``_should_compact``).  Sampled frames are read back to the host every
         ``sync_steps`` steps so graph construction overlaps GPU work; rows
         that finished inside a window are trimmed, so the window only costs
         a few wasted steps, never different output.  Results are yielded in
@@ -1676,6 +1902,7 @@ class Model(nn.Module):
             )
 
         uncond_index, expand_index, scale = cfg_indices()
+        done = [False] * count  # per batch position of ``active``
         sync_steps = max(1, int(sync_steps))
         pending_frames: list[mx.array] = []
         pending_eos: list[mx.array] = []
@@ -1733,25 +1960,28 @@ class Model(nn.Module):
             block_eos = mx.stack(pending_eos, axis=1).tolist()
             pending_frames, pending_eos = [], []
 
-            keep: list[int] = []
             for i, row in enumerate(active):
-                finished = False
+                if done[i]:
+                    continue
                 for frame_row, eos in zip(block_frames[i], block_eos[i]):
                     if eos:
-                        finished = True
+                        done[i] = True
                         break
                     frames[row].append(frame_row)
                     if len(frames[row]) >= token_caps[row]:
-                        finished = True
+                        done[i] = True
                         break
-                if not finished:
-                    keep.append(i)
-            if len(keep) == rows:
-                continue
+            keep = [i for i in range(rows) if not done[i]]
             if not keep:
                 break
-            # Drop finished rows (and their unconditional twins) from the
-            # batch so they no longer cost backbone or depth compute.
+            if len(keep) == rows:
+                continue
+            step_limit = max(token_caps[active[i]] for i in keep)
+            # Finished rows keep decoding (ignored) until removing them pays
+            # for the cache copy; then drop them and their unconditional
+            # twins so they no longer cost backbone or depth compute.
+            if not self._should_compact(rows, len(keep)):
+                continue
             kept_rows = {active[i] for i in keep}
             keep_uncond = [
                 rows + j for j, row in enumerate(active_uncond) if row in kept_rows
@@ -1764,8 +1994,8 @@ class Model(nn.Module):
                 seen = seen[mx.array(keep, dtype=mx.int32)]
             active = [active[i] for i in keep]
             active_uncond = [row for row in active_uncond if row in kept_rows]
+            done = [False] * len(active)
             uncond_index, expand_index, scale = cfg_indices()
-            step_limit = max(token_caps[row] for row in active)
             if verbose:
                 print(f"[breeze batch] step {steps}: {len(active)}/{count} rows active")
 

@@ -3,6 +3,7 @@
 
 import math
 import re
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -48,6 +49,7 @@ class CausalConv1d(nn.Module):
     ):
         super().__init__()
         self.stride = stride
+        self.dilation = dilation
         effective_kernel = (kernel_size - 1) * dilation + 1
         self.padding = effective_kernel - stride
 
@@ -63,11 +65,61 @@ class CausalConv1d(nn.Module):
             groups=groups,
         )
 
+    def _conv(self, x: mx.array) -> mx.array:
+        """``self.conv(x)`` on already padded input, as matrix products.
+
+        Output frame ``t`` reads ``kernel`` inputs ``dilation`` apart.  The
+        inputs of phase ``p`` (``x[:, p::dilation]``) hold every such window
+        for the outputs ``t = p (mod dilation)`` as consecutive rows, so a
+        strided view of each phase is a ``[frames, kernel * channels]``
+        matrix without copying, and one matmul per phase is the
+        convolution.  This is several times faster than ``nn.Conv1d`` here.
+        Grouped and strided convolutions keep ``nn.Conv1d``, and so do
+        float32 weights: Apple-GPU float32 matmuls round to ~1e-3, much
+        coarser than the float32 convolution kernels.
+        """
+        conv = self.conv
+        if conv.groups != 1 or self.stride != 1 or conv.weight.dtype == mx.float32:
+            return conv(x)
+        out_dim, kernel, in_dim = conv.weight.shape
+        weight = conv.weight.reshape(out_dim, kernel * in_dim).T
+        if kernel == 1:
+            y = x @ weight
+        else:
+            batch, length, _ = x.shape
+            dilation = self.dilation
+            frames = length - (kernel - 1) * dilation
+            extra = (-length) % dilation
+            if extra:
+                x = mx.pad(x, [(0, 0), (0, extra), (0, 0)])
+            rows = (length + extra) // dilation
+            windows = rows - (kernel - 1)
+            phases = (
+                [x] if dilation == 1 else [x[:, p::dilation] for p in range(dilation)]
+            )
+            ys = [
+                mx.as_strided(
+                    mx.contiguous(phase),
+                    shape=(batch, windows, kernel * in_dim),
+                    strides=(rows * in_dim, in_dim, 1),
+                )
+                @ weight
+                for phase in phases
+            ]
+            if dilation == 1:
+                y = ys[0]
+            else:
+                y = mx.stack(ys, axis=2).reshape(batch, windows * dilation, out_dim)
+            y = y[:, :frames]
+        if "bias" in conv:
+            y = y + conv.bias
+        return y
+
     def __call__(self, x: mx.array) -> mx.array:
         # x: [batch, time, channels] (NLC format)
         if self.padding > 0:
             x = mx.pad(x, [(0, 0), (self.padding, 0), (0, 0)])
-        return self.conv(x)
+        return self._conv(x)
 
     def step(self, x: mx.array) -> mx.array:
         """Incremental streaming step using internal buffer."""
@@ -77,7 +129,7 @@ class CausalConv1d(nn.Module):
             else:
                 x = mx.pad(x, [(0, 0), (self.padding, 0), (0, 0)])
             self._buffer = x[:, -self.padding :, :]
-        return self.conv(x)
+        return self._conv(x)
 
     def reset_state(self):
         """Reset streaming buffer."""
@@ -108,6 +160,16 @@ class CausalTransposeConv1d(nn.Module):
         return x
 
 
+@partial(mx.compile, shapeless=True)
+def _snake_beta(x: mx.array, alpha: mx.array, beta: mx.array, eps: float) -> mx.array:
+    """``x + 1/(exp(beta) + eps) * sin^2(x * exp(alpha))`` as one fused kernel.
+
+    Eagerly this is five element-wise passes over the activations, which
+    are large at the decoder's audio-rate stages.
+    """
+    return x + (1.0 / (mx.exp(beta) + eps)) * mx.power(mx.sin(x * mx.exp(alpha)), 2)
+
+
 class SnakeBeta(nn.Module):
     """Snake activation with learnable alpha and beta parameters.
 
@@ -122,9 +184,7 @@ class SnakeBeta(nn.Module):
         self.eps = 1e-9
 
     def __call__(self, x: mx.array) -> mx.array:
-        alpha = mx.exp(self.alpha)
-        beta = mx.exp(self.beta)
-        return x + (1.0 / (beta + self.eps)) * mx.power(mx.sin(x * alpha), 2)
+        return _snake_beta(x, self.alpha, self.beta, self.eps)
 
 
 class ConvNeXtBlock(nn.Module):
@@ -640,16 +700,46 @@ class DecoderBlockUpsample(nn.Module):
         self.trim_right = kernel_size - upsample_rate
         self._overflow = None  # Overlap-add buffer for streaming
 
+    def _transpose_conv(self, x: mx.array) -> mx.array:
+        """``self.conv(x)`` computed as one matmul plus an overlap-add.
+
+        The kernel spans exactly two strides, so every output frame of
+        ``stride`` samples is the first half of one input frame's
+        projection plus the second half of the previous one.  This is the
+        same sum as the transposed convolution (only the summation order
+        differs) and is several times faster than ``nn.ConvTranspose1d``.
+        """
+        weight = self.conv.weight  # [out, kernel, in]
+        out_dim, kernel, in_dim = weight.shape
+        stride = kernel // 2
+        batch, frames, _ = x.shape
+        y = x @ weight.reshape(out_dim * kernel, in_dim).T
+        y = y.reshape(batch, frames, out_dim, kernel).transpose(0, 1, 3, 2)
+        head = mx.pad(y[:, :, :stride], [(0, 0), (0, 1), (0, 0), (0, 0)])
+        tail = mx.pad(y[:, :, stride:], [(0, 0), (1, 0), (0, 0), (0, 0)])
+        y = (head + tail).reshape(batch, (frames + 1) * stride, out_dim)
+        if "bias" in self.conv:
+            y = y + self.conv.bias
+        return y
+
     def __call__(self, x: mx.array) -> mx.array:
-        # x: [batch, time, channels] (NLC format)
-        x = self.conv(x)
-        if self.trim_right > 0:
-            x = x[:, : -self.trim_right, :]
-        return x
+        # x: [batch, time, channels] (NLC format).  The trimmed output frame
+        # ``t`` is ``x[t] @ head + x[t - 1] @ tail``: two products fused.
+        weight = self.conv.weight  # [out, kernel, in]
+        out_dim, kernel, in_dim = weight.shape
+        stride = kernel // 2
+        batch, frames, _ = x.shape
+        weight = weight.transpose(1, 0, 2).reshape(kernel * out_dim, in_dim)
+        head, tail = weight[: stride * out_dim].T, weight[stride * out_dim :].T
+        previous = mx.pad(x, [(0, 0), (1, 0), (0, 0)])[:, :frames]
+        y = mx.addmm(x @ head, previous, tail).reshape(batch, frames * stride, out_dim)
+        if "bias" in self.conv:
+            y = y + self.conv.bias
+        return y
 
     def step(self, x: mx.array) -> mx.array:
         """Streaming step with overlap-add for ConvTranspose1d."""
-        y = self.conv(x)
+        y = self._transpose_conv(x)
         if self._overflow is not None:
             ov_len = self._overflow.shape[1]
             y = mx.concatenate(
@@ -754,9 +844,7 @@ class DecoderOutputSnake(nn.Module):
         self.eps = 1e-9
 
     def __call__(self, x: mx.array) -> mx.array:
-        alpha = mx.exp(self.alpha)
-        beta = mx.exp(self.beta)
-        return x + (1.0 / (beta + self.eps)) * mx.power(mx.sin(x * alpha), 2)
+        return _snake_beta(x, self.alpha, self.beta, self.eps)
 
 
 class DecoderOutputConv(nn.Module):

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from mlx_audio.tts.models.qwen3_tts.config import Qwen3TTSTokenizerDecoderConfig
@@ -14,9 +15,12 @@ from mlx_audio.tts.models.qwen3_tts.speaker_encoder import (
     reflect_pad_1d,
 )
 from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import (
+    CausalConv1d,
     DecoderBlockUpsample,
+    DecoderOutputSnake,
     DecoderTransformer,
     Qwen3TTSSpeechTokenizerDecoder,
+    SnakeBeta,
 )
 
 
@@ -1003,8 +1007,89 @@ class TestQwen3TTSBaseVoiceValidation(unittest.TestCase):
         self.assertTrue(results)
 
 
+class TestCausalConv1dMatmul(unittest.TestCase):
+    """The matmul convolution equals nn.Conv1d, in one call and streamed.
+
+    The matmul path serves float16/bfloat16 weights, so the weights are
+    rounded to bfloat16 and the inputs and arithmetic are float32 on the CPU,
+    where it is exact enough to compare at 1e-5.
+    """
+
+    def setUp(self):
+        self.device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        mx.random.seed(0)
+
+    def tearDown(self):
+        mx.set_default_device(self.device)
+
+    def test_matches_conv1d(self):
+        for kernel, dilation in ((7, 1), (7, 3), (7, 9), (3, 1), (1, 1)):
+            conv = CausalConv1d(8, 6, kernel, dilation=dilation)
+            conv.conv.bias = mx.random.normal(conv.conv.bias.shape)
+            conv.set_dtype(mx.bfloat16)
+            reference = nn.Conv1d(8, 6, kernel, dilation=dilation)
+            reference.weight = conv.conv.weight.astype(mx.float32)
+            reference.bias = conv.conv.bias.astype(mx.float32)
+            for frames in (1, 2, 13, 40):
+                x = mx.random.normal((2, frames, 8))
+                expected = reference(mx.pad(x, [(0, 0), (conv.padding, 0), (0, 0)]))
+                actual = conv(x)
+                self.assertEqual(actual.shape, expected.shape)
+                np.testing.assert_allclose(
+                    np.array(actual),
+                    np.array(expected),
+                    atol=1e-5,
+                    err_msg=f"kernel={kernel}, dilation={dilation}, frames={frames}",
+                )
+                conv.reset_state()
+                streamed = mx.concatenate(
+                    [conv.step(x[:, t : t + 3]) for t in range(0, frames, 3)], axis=1
+                )
+                np.testing.assert_allclose(
+                    np.array(streamed), np.array(expected), atol=1e-5
+                )
+
+    def test_float32_weights_keep_conv1d(self):
+        conv = CausalConv1d(8, 6, 7, dilation=3)
+        x = mx.random.normal((1, 9, 8))
+        expected = conv.conv(mx.pad(x, [(0, 0), (conv.padding, 0), (0, 0)]))
+        self.assertTrue(mx.array_equal(conv(x), expected).item())
+
+    def test_grouped_convolution_keeps_conv1d(self):
+        conv = CausalConv1d(8, 8, 7, groups=8)
+        x = mx.random.normal((1, 9, 8))
+        expected = conv.conv(mx.pad(x, [(0, 0), (conv.padding, 0), (0, 0)]))
+        np.testing.assert_allclose(np.array(conv(x)), np.array(expected), atol=1e-6)
+
+
+class TestSnakeActivation(unittest.TestCase):
+    """The compiled snake equals the eager formula for any shape."""
+
+    def test_matches_eager_formula(self):
+        mx.random.seed(0)
+        for cls in (SnakeBeta, DecoderOutputSnake):
+            act = cls(8)
+            act.alpha = mx.random.normal((8,)) * 0.3
+            act.beta = mx.random.normal((8,)) * 0.3
+            for shape in ((1, 5, 8), (2, 300, 8), (3, 1, 8)):
+                x = mx.random.normal(shape)
+                expected = x + (1.0 / (mx.exp(act.beta) + 1e-9)) * mx.power(
+                    mx.sin(x * mx.exp(act.alpha)), 2
+                )
+                np.testing.assert_allclose(
+                    np.array(act(x)), np.array(expected), rtol=1e-5, atol=1e-5
+                )
+
+
 class TestDecoderBlockUpsampleStreaming(unittest.TestCase):
     """Tests for DecoderBlockUpsample streaming (step) against the full call."""
+
+    # MLX's float32 matrix-matrix kernels on Apple GPUs round to about 1e-3
+    # relative error, while a one-row input takes the exact matrix-vector
+    # kernel; the block's matmul form therefore differs by ~1e-3 between
+    # chunk sizes.  A doubled or missing bias (magnitude ~1) still fails.
+    ATOL = 5e-3
 
     def _block(self, upsample_rate):
         mx.random.seed(0)
@@ -1022,6 +1107,22 @@ class TestDecoderBlockUpsampleStreaming(unittest.TestCase):
         self.assertEqual(start, x.shape[1])
         return mx.concatenate(out, axis=1)
 
+    def test_matmul_form_matches_conv_transpose(self):
+        """The matmul + overlap-add form equals nn.ConvTranspose1d."""
+        for upsample_rate in (2, 3, 4, 5, 8):
+            block = self._block(upsample_rate)
+            for frames in (1, 2, 13):
+                x = mx.random.normal((2, frames, 6))
+                expected = block.conv(x)[:, : -block.trim_right, :]
+                actual = block(x)
+                self.assertEqual(actual.shape, expected.shape)
+                np.testing.assert_allclose(
+                    np.array(actual),
+                    np.array(expected),
+                    atol=self.ATOL,
+                    err_msg=f"upsample_rate={upsample_rate}, frames={frames}",
+                )
+
     def test_step_matches_full_call_for_any_chunking(self):
         """Test that streaming in any chunk sizes matches one call."""
         for upsample_rate in (2, 4, 8):
@@ -1034,7 +1135,7 @@ class TestDecoderBlockUpsampleStreaming(unittest.TestCase):
                 np.testing.assert_allclose(
                     np.array(streamed),
                     np.array(full),
-                    atol=1e-5,
+                    atol=self.ATOL,
                     err_msg=f"upsample_rate={upsample_rate}, chunks={chunks}",
                 )
 
