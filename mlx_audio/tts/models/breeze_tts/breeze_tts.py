@@ -501,6 +501,32 @@ class _TextEncoder(nn.Module):
         return self.norm(hidden)
 
 
+class _DepthKVCache:
+    """Per-frame depth cache: grows by concatenation, holds exactly the frame.
+
+    A depth frame is at most 16 positions.  ``KVCache`` reserves 256 slots
+    per row and layer (zero-filled for every frame) and hands attention a
+    strided view of them; returning the contiguous concatenation instead is
+    5-12% faster per frame from 8 rows up, with identical tokens.  There is
+    deliberately no ``make_mask``: positions are added one at a time, so
+    ``create_attention_mask`` returns ``None`` (no mask) as it should.
+    """
+
+    def __init__(self):
+        self.keys: Optional[mx.array] = None
+        self.values: Optional[mx.array] = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        if self.keys is None:
+            self.keys, self.values = keys, values
+        else:
+            self.keys = mx.concatenate([self.keys, keys], axis=2)
+            self.values = mx.concatenate([self.values, values], axis=2)
+        self.offset += keys.shape[2]
+        return self.keys, self.values
+
+
 class _DepthModel(nn.Module):
     """Breeze's codebook-autoregressive depth decoder."""
 
@@ -549,9 +575,9 @@ class _DepthModel(nn.Module):
         ]
         self.norm = nn.RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
 
-    def make_cache(self) -> list[KVCache]:
+    def make_cache(self) -> list[_DepthKVCache]:
         """A fresh KV cache for one frame of depth decoding."""
-        return [KVCache() for _ in self.layers]
+        return [_DepthKVCache() for _ in self.layers]
 
     def store_linear_weights_transposed(self) -> None:
         """Keep each Linear weight as a transposed view of an [in, out] buffer.
