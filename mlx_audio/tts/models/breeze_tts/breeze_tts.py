@@ -792,9 +792,10 @@ class Model(nn.Module):
     def _codec_decode_dtype() -> mx.Dtype:
         """Precision of the codec's waveform decoder (not its encoder).
 
-        Half precision is the default: it decodes about 1.4x faster with
-        half the memory, and stays 42-46 dB below the float32 waveform on
-        speech.  Set ``MLX_AUDIO_BREEZE_CODEC_DTYPE=float32`` to keep the
+        Half precision is the default: on an Apple M6 it decodes about 2.3x
+        faster than float32 with half the memory; against the float32
+        waveform the difference is typically 43-45 dB below the signal and
+        30-36 dB on the worst clips measured.  Set ``MLX_AUDIO_BREEZE_CODEC_DTYPE=float32`` to keep the
         checkpoint's precision.
         """
         raw = os.environ.get(CODEC_DTYPE_ENV, "").strip().lower() or "float16"

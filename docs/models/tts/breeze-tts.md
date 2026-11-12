@@ -143,9 +143,11 @@ for result in model.generate(
 ## Codec precision
 
 The waveform decoder of the bundled codec runs in half precision by default.
-On an Apple M-series GPU it decodes about 1.4x faster and needs half the
-memory; the result stays 42-46 dB below the float32 waveform on speech. The
-codec encoder (reference clips) and the language model are not affected.
+On an Apple M6 it decodes about 2.3x faster than float32 (0.75 vs 1.74 ms per
+12.5 Hz frame) and needs half the memory. Against the float32 waveform the
+difference is typically 43-45 dB below the signal, and 30-36 dB on the
+worst clips measured. The codec encoder (reference clips) and the language
+model are not affected.
 Set the environment variable before loading the model to keep the
 checkpoint's float32 precision:
 
