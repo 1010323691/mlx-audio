@@ -544,6 +544,21 @@ class _DepthModel(nn.Module):
         """A fresh KV cache for one frame of depth decoding."""
         return [KVCache() for _ in self.layers]
 
+    def store_linear_weights_transposed(self) -> None:
+        """Keep each Linear weight as a transposed view of an [in, out] buffer.
+
+        ``nn.Linear`` computes ``x @ weight.T``.  With the checkpoint's
+        row-major ``[out, in]`` weights, MLX's matmul for more than 64 rows
+        streams the transposed operand once per 64-row tile; stored this
+        way, ``weight.T`` is row-major and the 16 depth passes per frame run
+        9-17% faster at 72-128 rows, unchanged at 64 rows or fewer.  The
+        values (and the parameter shapes) are the same; only the memory
+        layout changes, so it costs no extra memory.
+        """
+        for _, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                module.weight = mx.contiguous(module.weight.T).T
+
     def embed_codebook_token(
         self, token_id: Union[int, mx.array], codebook_idx: int
     ) -> mx.array:
@@ -766,6 +781,8 @@ class Model(nn.Module):
                 f"Breeze checkpoint has no audio_tokenizer at {codec_path}"
             )
         model.audio_tokenizer = cls._load_audio_tokenizer(codec_path)
+        model.depth_decoder.model.store_linear_weights_transposed()
+        mx.eval(model.depth_decoder.parameters())
         codec_dtype = cls._codec_decode_dtype()
         if codec_dtype != mx.float32:
             model.audio_tokenizer.decoder.set_compute_dtype(codec_dtype)

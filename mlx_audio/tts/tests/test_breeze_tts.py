@@ -8,7 +8,7 @@ try:
 except (ImportError, RuntimeError) as exc:  # pragma: no cover - no Metal host
     pytest.skip(f"MLX device unavailable: {exc}", allow_module_level=True)
 
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
 
 from mlx_audio.tts.models.breeze_tts.breeze_tts import (
     CODEC_DTYPE_ENV,
@@ -594,3 +594,27 @@ def test_batched_text_encoding_matches_per_string_and_dedups(monkeypatch):
     )[0, :1]
     alone = model.text_encoder_proj(model.text_encoder(mx.array([[3]])))[0]
     assert float(mx.abs(unmasked - alone).max()) > 4 * tolerance
+
+
+def test_depth_weights_stored_transposed_keep_values_and_shapes():
+    mx.random.seed(0)
+    model = Model(tiny_config())
+    model.update(
+        tree_map(lambda p: mx.random.normal(p.shape) * 0.2, model.parameters())
+    )
+    depth = model.depth_decoder
+    hidden = mx.random.normal((5, 16))
+    tokens = mx.array([1, 2, 3, 4, 5])
+
+    def frame():
+        cache = depth.model.make_cache()
+        depth.start_frame(hidden, cache)
+        return depth.step_logits(cache, head_idx=0, token_id=tokens)
+
+    before = frame()
+    shapes = {k: v.shape for k, v in tree_flatten(depth.parameters())}
+    depth.model.store_linear_weights_transposed()
+    after = frame()
+
+    assert {k: v.shape for k, v in tree_flatten(depth.parameters())} == shapes
+    np.testing.assert_allclose(np.array(after), np.array(before), atol=1e-4)
