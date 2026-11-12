@@ -11,6 +11,7 @@ import math
 import os
 import re
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional, Union
 
@@ -879,9 +880,46 @@ class Model(nn.Module):
             raise RuntimeError("Breeze tokenizer was not loaded")
         return mx.array(self.tokenizer(text, add_special_tokens=True)["input_ids"])
 
+    # Reference clips encoded by path, kept across calls (a few KiB each).
+    REFERENCE_CACHE_SIZE = 64
+
     def _encode_reference(self, ref_audio: Union[str, Path, mx.array]) -> mx.array:
+        """Codec codes ``[1, frames, codebooks]`` of a reference clip.
+
+        Clips given by path are cached across calls, keyed by the resolved
+        path, modification time, size and codec, so a replaced file (or a
+        swapped codec) is re-encoded.
+        """
         if self.audio_tokenizer is None:
             raise RuntimeError("Breeze audio tokenizer was not loaded")
+        key = None
+        if isinstance(ref_audio, (str, Path)):
+            try:
+                stat = os.stat(ref_audio)
+                key = (
+                    os.path.realpath(ref_audio),
+                    stat.st_mtime_ns,
+                    stat.st_size,
+                    id(self.audio_tokenizer),
+                )
+            except OSError:
+                key = None
+            # A plain attribute: nn.Module would treat a dict as parameters.
+            cache = self.__dict__.setdefault("_reference_codes", OrderedDict())
+            if key is not None and key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+            codes = self._encode_reference_audio(ref_audio)
+            if key is not None:
+                cache[key] = codes
+                while len(cache) > self.REFERENCE_CACHE_SIZE:
+                    cache.popitem(last=False)
+            return codes
+        return self._encode_reference_audio(ref_audio)
+
+    def _encode_reference_audio(
+        self, ref_audio: Union[str, Path, mx.array]
+    ) -> mx.array:
         if isinstance(ref_audio, (str, Path)):
             audio = load_audio(str(ref_audio), sample_rate=self.sample_rate)
         else:

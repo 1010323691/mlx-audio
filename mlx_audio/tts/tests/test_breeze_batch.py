@@ -361,6 +361,25 @@ def test_shared_reference_is_encoded_once(cpu):
     assert model.audio_tokenizer.encode_calls == 1
 
 
+def test_reference_clip_files_are_encoded_once_across_calls(cpu, tmp_path):
+    import numpy as np
+    import soundfile as sf
+
+    model = _model(2)
+    clip = tmp_path / "voice.wav"
+    sf.write(clip, np.full(2400, 0.1, dtype=np.float32), model.sample_rate)
+    kwargs = dict(ref_audios=str(clip), ref_texts="ref", max_tokens=2)
+    list(model.batch_generate(["a", "bb"], **kwargs))
+    list(model.batch_generate(["ccc"], **kwargs))
+    list(model.generate("dd", ref_audio=str(clip), ref_text="ref", max_tokens=2))
+    assert model.audio_tokenizer.encode_calls == 1
+
+    # A replaced file is encoded again.
+    sf.write(clip, np.full(3200, 0.2, dtype=np.float32), model.sample_rate)
+    list(model.batch_generate(["a"], **kwargs))
+    assert model.audio_tokenizer.encode_calls == 2
+
+
 def test_sampled_batch_respects_max_tokens_and_seed(cpu):
     model = _model(3)
     kwargs = dict(temperature=0.9, top_k=5, top_p=0.9, max_tokens=7, seed=11)
