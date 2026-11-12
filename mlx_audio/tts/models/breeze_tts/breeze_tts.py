@@ -1164,24 +1164,20 @@ class Model(nn.Module):
         return audio
 
     def _decode_codes(self, codes: mx.array) -> mx.array:
-        """Decode one sequence and honor the tokenizer's valid length."""
+        """Decode one unpadded sequence into its full waveform.
+
+        The codec also returns a "valid length", counted as the frames whose
+        first code is above 0, for batches right-padded with zeros.  Breeze
+        never pads: a row ends at the EOS class, and 0 is an ordinary code
+        that turns up inside speech (about 1 frame in 700), so that length
+        cut 80 ms off the end of the row for every such frame.
+        """
         decoded = self.audio_tokenizer.decode(codes)
-        lengths = None
         if isinstance(decoded, (list, tuple)):
             if not decoded:
                 return mx.zeros((0,), dtype=mx.float32)
-            audio_data = decoded[0]
-            if len(decoded) > 1:
-                lengths = decoded[1]
-        else:
-            audio_data = decoded
-        audio = self._audio_vector(audio_data)
-        if lengths is not None:
-            lengths = mx.array(lengths).reshape(-1)
-            if lengths.shape[0]:
-                valid_samples = max(0, int(lengths[0].item()))
-                audio = audio[:valid_samples]
-        return audio
+            decoded = decoded[0]
+        return self._audio_vector(decoded)
 
     def _empty_audio(self) -> mx.array:
         """Return the official silent fallback when EOS precedes all frames."""
